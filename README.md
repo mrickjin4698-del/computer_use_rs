@@ -1,5 +1,7 @@
 # Alice Computer Use
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A security-oriented, model-agnostic computer-use runtime for Windows, written in Rust.
 
 The project captures desktop observations, exposes Windows UI Automation elements,
