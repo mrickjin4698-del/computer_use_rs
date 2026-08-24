@@ -1,0 +1,13 @@
+[package]
+name = "alice-computer-use-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Domain types and contracts for Alice Computer Use"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

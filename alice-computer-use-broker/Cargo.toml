@@ -1,0 +1,28 @@
+[package]
+name = "alice-computer-use-broker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Policy, approval, lease, and audit broker for Alice Computer Use"
+publish = false
+
+[dependencies]
+alice-computer-use-core = { path = "../alice-computer-use-core" }
+alice-computer-use-sidecar-client = { path = "../alice-computer-use-sidecar-client" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

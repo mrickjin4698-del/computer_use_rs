@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "alice-computer-use-core",
+    "alice-computer-use-runtime",
+    "alice-computer-use-sidecar-protocol",
+    "alice-computer-use-sidecar-client",
+    "alice-computer-use-broker",
+    "alice-computer",
+    "alice-computer-mcp",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
