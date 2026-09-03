@@ -274,6 +274,7 @@ fn gate_tools(mcp: &mut McpProcess) -> GateResult<()> {
         "computer_health",
         "computer_observe",
         "computer_execute",
+        "computer_use",
         "computer_screenshot",
         "computer_validate",
     ];

@@ -5,7 +5,11 @@
 //! bounded monotonic counters.  The broker samples those counters when it
 //! admits and completes a short-lived interaction lease.
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub const ALICE_COMPUTER_INPUT_MARKER: usize =
@@ -63,7 +67,10 @@ struct InputActivityMonitorInner {
     other_injected_mouse_wheel_sequence: AtomicU64,
     other_injected_keyboard_sequence: AtomicU64,
     unknown_sequence: AtomicU64,
+    #[cfg(windows)]
     thread_id: AtomicU32,
+    #[cfg(target_os = "macos")]
+    run_loop: AtomicPtr<c_void>,
 }
 
 impl InputActivityMonitorInner {
@@ -85,7 +92,10 @@ impl InputActivityMonitorInner {
             other_injected_mouse_wheel_sequence: AtomicU64::new(0),
             other_injected_keyboard_sequence: AtomicU64::new(0),
             unknown_sequence: AtomicU64::new(0),
+            #[cfg(windows)]
             thread_id: AtomicU32::new(0),
+            #[cfg(target_os = "macos")]
+            run_loop: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -177,13 +187,15 @@ impl InputActivityMonitorInner {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 static GLOBAL_MONITOR: AtomicPtr<InputActivityMonitorInner> = AtomicPtr::new(std::ptr::null_mut());
 
 pub struct InputActivityMonitor {
     inner: Arc<InputActivityMonitorInner>,
     #[cfg(windows)]
     hook_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(target_os = "macos")]
+    event_tap_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl InputActivityMonitor {
@@ -241,9 +253,56 @@ impl InputActivityMonitor {
             }
         }
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
-            inner.available.store(true, Ordering::Release);
+            let pointer = Arc::as_ptr(&inner) as *mut InputActivityMonitorInner;
+            if GLOBAL_MONITOR
+                .compare_exchange(
+                    std::ptr::null_mut(),
+                    pointer,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                inner.running.store(false, Ordering::Release);
+                return Self {
+                    inner,
+                    event_tap_thread: std::sync::Mutex::new(None),
+                };
+            }
+
+            let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+            let thread_inner = Arc::clone(&inner);
+            let mut event_tap_thread = Some(std::thread::spawn(move || {
+                mac_event_tap_thread_main(thread_inner, ready_sender)
+            }));
+            let installed = ready_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap_or(false);
+            if !installed {
+                inner.running.store(false, Ordering::Release);
+                let run_loop = inner.run_loop.load(Ordering::Acquire);
+                if !run_loop.is_null() {
+                    unsafe { CFRunLoopStop(run_loop) };
+                }
+                if let Some(thread) = event_tap_thread.take() {
+                    let _ = thread.join();
+                }
+                GLOBAL_MONITOR.store(std::ptr::null_mut(), Ordering::Release);
+            }
+            Self {
+                inner,
+                event_tap_thread: std::sync::Mutex::new(event_tap_thread),
+            }
+        }
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            // There is no safe generic input-attribution implementation for
+            // other platforms. Keep observation available, but fail closed
+            // for side-effect actions in the broker.
+            inner.available.store(false, Ordering::Release);
             Self { inner }
         }
     }
@@ -267,7 +326,14 @@ impl InputActivityMonitor {
                 hook_thread: std::sync::Mutex::new(None),
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                inner,
+                event_tap_thread: std::sync::Mutex::new(None),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             Self { inner }
         }
@@ -276,6 +342,26 @@ impl InputActivityMonitor {
     #[cfg(test)]
     pub(crate) fn record_for_test(&self, source: InputSource, kind: InputEventKind) {
         self.inner.record(source, kind);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for InputActivityMonitor {
+    fn drop(&mut self) {
+        self.inner.running.store(false, Ordering::Release);
+        GLOBAL_MONITOR.store(std::ptr::null_mut(), Ordering::Release);
+        let run_loop = self.inner.run_loop.load(Ordering::Acquire);
+        if !run_loop.is_null() {
+            unsafe { CFRunLoopStop(run_loop) };
+        }
+        if let Some(thread) = self
+            .event_tap_thread
+            .lock()
+            .expect("input monitor event tap thread poisoned")
+            .take()
+        {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -451,6 +537,143 @@ fn hook_thread_main(
         UnhookWindowsHookEx(mouse_hook);
     }
     inner.available.store(false, Ordering::Release);
+}
+
+#[cfg(target_os = "macos")]
+type MacCGEventTapCallback = unsafe extern "C" fn(
+    proxy: *const c_void,
+    event_type: u32,
+    event: *const c_void,
+    user_info: *mut c_void,
+) -> *const c_void;
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFRunLoopCommonModes: *const c_void;
+    fn CFRunLoopGetCurrent() -> *mut c_void;
+    fn CFRunLoopRun();
+    fn CFRunLoopStop(run_loop: *mut c_void);
+    fn CFRunLoopAddSource(run_loop: *mut c_void, source: *const c_void, mode: *const c_void);
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const c_void,
+        port: *const c_void,
+        order: isize,
+    ) -> *const c_void;
+    fn CFRelease(value: *const c_void);
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: Option<MacCGEventTapCallback>,
+        user_info: *mut c_void,
+    ) -> *const c_void;
+    fn CGEventTapEnable(tap: *const c_void, enable: u8);
+    fn CGEventGetIntegerValueField(event: *const c_void, field: u32) -> i64;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn mac_event_tap_callback(
+    _proxy: *const c_void,
+    event_type: u32,
+    event: *const c_void,
+    _user_info: *mut c_void,
+) -> *const c_void {
+    let pointer = GLOBAL_MONITOR.load(Ordering::Acquire);
+    if pointer.is_null() || event.is_null() {
+        return event;
+    }
+    let monitor = &*pointer;
+    if !monitor.running.load(Ordering::Acquire) {
+        return event;
+    }
+    let kind = match event_type {
+        5 | 6 => InputEventKind::MouseMove,
+        1 | 2 | 3 | 4 | 7 | 8 | 9 => InputEventKind::MouseButton,
+        10..=12 => InputEventKind::Keyboard,
+        22 => InputEventKind::MouseWheel,
+        _ => {
+            monitor.record(InputSource::Unknown, InputEventKind::Unknown);
+            return event;
+        }
+    };
+    let marker = CGEventGetIntegerValueField(event, 42);
+    let source = if marker == monitor.expected_marker as i64 {
+        InputSource::AliceInjected
+    } else if marker != 0 {
+        InputSource::OtherInjected
+    } else {
+        InputSource::Hardware
+    };
+    monitor.record(source, kind);
+    event
+}
+
+#[cfg(target_os = "macos")]
+fn mac_event_tap_thread_main(
+    inner: Arc<InputActivityMonitorInner>,
+    ready_sender: std::sync::mpsc::Sender<bool>,
+) {
+    const EVENT_MASK: u64 = (1u64 << 1)
+        | (1u64 << 2)
+        | (1u64 << 3)
+        | (1u64 << 4)
+        | (1u64 << 5)
+        | (1u64 << 6)
+        | (1u64 << 7)
+        | (1u64 << 8)
+        | (1u64 << 9)
+        | (1u64 << 10)
+        | (1u64 << 11)
+        | (1u64 << 12)
+        | (1u64 << 22);
+
+    let tap = unsafe {
+        CGEventTapCreate(
+            0,
+            0,
+            1,
+            EVENT_MASK,
+            Some(mac_event_tap_callback),
+            std::ptr::null_mut(),
+        )
+    };
+    if tap.is_null() {
+        inner.available.store(false, Ordering::Release);
+        let _ = ready_sender.send(false);
+        return;
+    }
+    let run_loop = unsafe { CFRunLoopGetCurrent() };
+    let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
+    if run_loop.is_null() || source.is_null() {
+        unsafe { CFRelease(tap) };
+        inner.available.store(false, Ordering::Release);
+        let _ = ready_sender.send(false);
+        return;
+    }
+    inner.run_loop.store(run_loop, Ordering::Release);
+    unsafe {
+        CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
+        CGEventTapEnable(tap, 1);
+    }
+    inner.available.store(true, Ordering::Release);
+    let _ = ready_sender.send(true);
+    unsafe { CFRunLoopRun() };
+    inner.running.store(false, Ordering::Release);
+    inner.available.store(false, Ordering::Release);
+    inner
+        .run_loop
+        .store(std::ptr::null_mut(), Ordering::Release);
+    unsafe {
+        CFRelease(source);
+        CFRelease(tap);
+    }
 }
 
 #[cfg(all(test, windows))]

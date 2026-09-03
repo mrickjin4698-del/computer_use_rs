@@ -60,6 +60,7 @@ dependencies = [
  "async-trait",
  "png",
  "serde",
+ "serde_json",
  "tokio",
  "windows",
 ]

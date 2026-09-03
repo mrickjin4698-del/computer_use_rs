@@ -66,7 +66,7 @@ impl RequestReplayWindow {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(error) = run().await {
@@ -75,13 +75,13 @@ async fn main() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn main() {
-    eprintln!("alice-computer requires Windows native APIs");
+    eprintln!("alice-computer requires Windows or macOS native APIs");
     process::exit(1);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
@@ -112,19 +112,19 @@ async fn run() -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn print_help() {
     println!(
         "alice-computer\n\n  serve\n  windows\n  elements --window <WindowId> [--max-depth <n>] [--max-elements <n>]\n  screenshot --output <path>\n\nserve uses framed JSON on stdout; diagnostics use human-readable stdout."
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn print_screenshot_help() {
     println!("usage: alice-computer screenshot --output <path>");
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn diagnostic_windows() -> Result<(), String> {
     let runtime = ComputerRuntime::new(WinNativeBackend::new());
     runtime
@@ -143,6 +143,18 @@ async fn diagnostic_windows() -> Result<(), String> {
         .native_desktop_identity()
         .await
         .map_err(|error| error.to_string())?;
+    let capabilities = runtime
+        .capabilities()
+        .await
+        .into_iter()
+        .map(|capability| {
+            serde_json::json!({
+                "name": capability.name,
+                "state": format!("{:?}", capability.state).to_ascii_lowercase(),
+                "detail": capability.detail,
+            })
+        })
+        .collect::<Vec<_>>();
     let screens = session
         .enumerate_screens()
         .await
@@ -161,6 +173,7 @@ async fn diagnostic_windows() -> Result<(), String> {
                 "current": desktop_identity.0,
                 "input": desktop_identity.1,
             },
+            "capabilities": capabilities,
             "screens": screens,
             "windows": windows,
         }))
@@ -174,7 +187,7 @@ async fn diagnostic_windows() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn diagnostic_elements(arguments: Vec<String>) -> Result<(), String> {
     let mut window_id = None;
     let mut max_depth = None;
@@ -253,7 +266,7 @@ async fn diagnostic_elements(arguments: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn print_element_tree(
     elements: &HashMap<
         alice_computer_use_core::ElementId,
@@ -284,7 +297,7 @@ fn print_element_tree(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn diagnostic_screenshot(output: Option<PathBuf>) -> Result<(), String> {
     let output = output.ok_or_else(|| "screenshot requires --output <path>".to_owned())?;
     let runtime = ComputerRuntime::new(WinNativeBackend::new());
@@ -326,23 +339,36 @@ async fn diagnostic_screenshot(output: Option<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct ServerState {
     runtime: ComputerRuntime<WinNativeBackend>,
+    initialized: bool,
     sessions:
         HashMap<ComputerSessionId, alice_computer_use_runtime::ComputerSession<WinNativeBackend>>,
     window_maps: HashMap<ComputerSessionId, WindowMap>,
     request_ids: RequestReplayWindow,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
+impl ServerState {
+    async fn ensure_initialized(&mut self) -> Result<(), ComputerError> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.runtime.initialize().await?;
+        self.initialized = true;
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 struct WindowMap {
     next_id: u64,
     public_to_backend: HashMap<WindowId, WindowId>,
     backend_to_public: HashMap<String, WindowId>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl WindowMap {
     fn new() -> Self {
         Self {
@@ -375,15 +401,12 @@ impl WindowMap {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn serve() -> Result<(), String> {
     let runtime = ComputerRuntime::new(WinNativeBackend::new());
-    runtime
-        .initialize()
-        .await
-        .map_err(|error| error.to_string())?;
     let mut state = ServerState {
         runtime,
+        initialized: false,
         sessions: HashMap::new(),
         window_maps: HashMap::new(),
         request_ids: RequestReplayWindow::new(MAX_TRACKED_REQUEST_IDS),
@@ -460,7 +483,7 @@ async fn serve() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn handle_request(
     state: &mut ServerState,
     request: RpcRequest,
@@ -485,25 +508,31 @@ async fn handle_request(
                 pid: process::id(),
             },
         ),
-        "health" => ok_response(
-            request_id,
-            &HealthResult {
-                ready: true,
-                initialized: true,
-                session_count: state.sessions.len(),
-                pid: process::id(),
-                security: state.runtime.security_context().await.ok(),
-                desktop: state.runtime.desktop_security_context().await.ok(),
+        "health" => match state.ensure_initialized().await {
+            Ok(()) => ok_response(
+                request_id,
+                &HealthResult {
+                    ready: true,
+                    initialized: true,
+                    session_count: state.sessions.len(),
+                    pid: process::id(),
+                    security: state.runtime.security_context().await.ok(),
+                    desktop: state.runtime.desktop_security_context().await.ok(),
+                },
+            ),
+            Err(error) => error_response(request_id, sidecar_computer_error(error)),
+        },
+        "session.create" => match state.ensure_initialized().await {
+            Ok(()) => match state.runtime.start_session().await {
+                Ok(session) => {
+                    let id = session.id().clone();
+                    state.sessions.insert(id.clone(), session);
+                    state.window_maps.insert(id.clone(), WindowMap::new());
+                    ok_response(request_id, &SessionResult { session_id: id })
+                }
+                Err(error) => error_response(request_id, computer_error(error)),
             },
-        ),
-        "session.create" => match state.runtime.start_session().await {
-            Ok(session) => {
-                let id = session.id().clone();
-                state.sessions.insert(id.clone(), session);
-                state.window_maps.insert(id.clone(), WindowMap::new());
-                ok_response(request_id, &SessionResult { session_id: id })
-            }
-            Err(error) => error_response(request_id, computer_error(error)),
+            Err(error) => error_response(request_id, sidecar_computer_error(error)),
         },
         "session.close" => match params::<SessionParams>(&request) {
             Ok(params) => match state.sessions.get(&params.session_id).cloned() {
@@ -812,7 +841,7 @@ async fn handle_request(
             state.sessions.clear();
             state.window_maps.clear();
             let result = state.runtime.shutdown().await;
-            match result {
+            let response = match result {
                 Ok(()) => ok_response(
                     request_id,
                     &ShutdownResult {
@@ -821,7 +850,9 @@ async fn handle_request(
                     },
                 ),
                 Err(error) => error_response(request_id, sidecar_computer_error(error)),
-            }
+            };
+            state.initialized = false;
+            response
         }
         _ => error_response(
             request_id,
@@ -835,7 +866,7 @@ async fn handle_request(
     Ok(request.method == "shutdown")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn public_windows(
     state: &mut ServerState,
     session_id: &ComputerSessionId,
@@ -854,7 +885,7 @@ fn public_windows(
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn public_observation(
     state: &mut ServerState,
     mut observation: ComputerObservation,
@@ -871,7 +902,7 @@ fn public_observation(
     observation
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn backend_window_id(
     state: &ServerState,
     session_id: &ComputerSessionId,
@@ -884,7 +915,7 @@ fn backend_window_id(
         .backend_id(public_window_id)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn internal_action(
     state: &ServerState,
     session_id: &ComputerSessionId,
@@ -991,7 +1022,7 @@ fn internal_action(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn internal_execution_request(
     state: &ServerState,
     session_id: &ComputerSessionId,
@@ -1005,6 +1036,7 @@ fn internal_execution_request(
     if let ComputerExecutionIntent::Pixel {
         action,
         target_window_id,
+        ..
     } = &mut internal.intent
     {
         *action = internal_action(state, session_id, action)?;
@@ -1016,7 +1048,7 @@ fn internal_execution_request(
     Ok(internal)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn public_execution_result(
     state: &mut ServerState,
     session_id: &ComputerSessionId,
@@ -1031,6 +1063,7 @@ fn public_execution_result(
         ComputerExecutionIntent::Pixel {
             action,
             target_window_id,
+            ..
         } => {
             *action = public_action(action.clone(), map);
             *target_window_id = target_window_id
@@ -1050,7 +1083,7 @@ fn public_execution_result(
     result
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn public_action(mut action: ComputerAction, map: &mut WindowMap) -> ComputerAction {
     let public = |map: &mut WindowMap, target: &Option<WindowId>| {
         target.as_ref().map(|window_id| map.public_id(window_id))
@@ -1077,12 +1110,13 @@ fn public_action(mut action: ComputerAction, map: &mut WindowMap) -> ComputerAct
         | ComputerAction::RightClick { .. }
         | ComputerAction::MovePointer { .. }
         | ComputerAction::Drag { .. }
-        | ComputerAction::Scroll { .. } => {}
+        | ComputerAction::Scroll { .. }
+        | ComputerAction::ModifiedPointer { .. } => {}
     }
     action
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn public_action_result(mut result: ComputerActionResult) -> ComputerActionResult {
     if let Some(detail) = result.backend_detail.take() {
         result.backend_detail = Some(if detail.contains("hwnd=") {
@@ -1095,7 +1129,7 @@ fn public_action_result(mut result: ComputerActionResult) -> ComputerActionResul
     result
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn sidecar_computer_error(error: ComputerError) -> RpcError {
     let mut rpc_error = computer_error(error);
     rpc_error.message = match rpc_error.code.as_str() {
@@ -1123,13 +1157,13 @@ fn sidecar_computer_error(error: ComputerError) -> RpcError {
     rpc_error
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn params<T: DeserializeOwned>(request: &RpcRequest) -> Result<T, RpcError> {
     serde_json::from_value(request.params.clone())
         .map_err(|error| invalid_params(error.to_string()))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn session(
     state: &ServerState,
     id: &ComputerSessionId,
@@ -1141,12 +1175,12 @@ fn session(
         .ok_or_else(|| invalid_session(id))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn invalid_session(id: &ComputerSessionId) -> RpcError {
     RpcError::new("INVALID_SESSION", format!("session is not valid: {id}"))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn capability_info(capability: alice_computer_use_runtime::Capability) -> CapabilityInfo {
     let state = match capability.state {
         alice_computer_use_runtime::CapabilityState::Supported => "supported",

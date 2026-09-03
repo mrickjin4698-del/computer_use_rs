@@ -6,6 +6,9 @@ license = "Apache-2.0"
 description = "Host-side sidecar client for Alice Computer Use"
 publish = false
 
+[features]
+interactive-e2e = []
+
 [dependencies]
 alice-computer-use-core = { path = "../alice-computer-use-core" }
 alice-computer-use-sidecar-protocol = { path = "../alice-computer-use-sidecar-protocol" }
@@ -25,3 +28,53 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+
+[[example]]
+name = "prod_r0_host_service"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r0_client_smoke"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r0_interactive_gates"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r1_semantic_gates"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r2_semantic_actions"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r3_execution_policy"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r6_sidecar_gates"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r7_sidecar_gates"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r8_security_gates"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r9_compatibility_matrix"
+test = false
+required-features = ["interactive-e2e"]

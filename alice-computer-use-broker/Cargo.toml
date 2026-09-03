@@ -6,6 +6,9 @@ license = "Apache-2.0"
 description = "Policy, approval, lease, and audit broker for Alice Computer Use"
 publish = false
 
+[features]
+interactive-e2e = []
+
 [dependencies]
 alice-computer-use-core = { path = "../alice-computer-use-core" }
 alice-computer-use-sidecar-client = { path = "../alice-computer-use-sidecar-client" }
@@ -26,3 +29,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[[example]]
+name = "r1_broker_gates"
+test = false
+required-features = ["interactive-e2e"]

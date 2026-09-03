@@ -227,7 +227,8 @@ pub(crate) fn risk_for(request: &ComputerExecutionRequest) -> ComputerRiskLevel 
             | ComputerAction::MovePointer { .. }
             | ComputerAction::Drag { .. }
             | ComputerAction::Scroll { .. }
-            | ComputerAction::FocusWindow { .. } => ComputerRiskLevel::BenignInteraction,
+            | ComputerAction::FocusWindow { .. }
+            | ComputerAction::ModifiedPointer { .. } => ComputerRiskLevel::BenignInteraction,
             ComputerAction::TypeText { .. }
             | ComputerAction::KeyPress { .. }
             | ComputerAction::Hotkey { .. }

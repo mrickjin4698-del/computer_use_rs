@@ -218,7 +218,14 @@ pub struct CaptureFrameMetadata {
     pub pixel_format: FramePixelFormat,
     pub stride: u32,
     pub dpi: DpiScale,
+    /// Display DPI scale, retained for diagnostics and UI sizing.
     pub scale: DpiScale,
+    /// Explicit conversion from screenshot pixels to DesktopPhysical units.
+    /// This is not always the display DPI scale: Windows captures physical
+    /// pixels in a per-monitor-aware process, while macOS Quartz events use
+    /// logical points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_to_desktop_scale: Option<DpiScale>,
     pub captured_at: Option<SystemTime>,
     pub content_revision: u64,
     #[serde(default)]
@@ -535,7 +542,12 @@ pub struct ScreenshotMetadata {
     pub coordinate_space: CoordinateSpace,
     pub desktop_origin: Point,
     pub dpi: DpiScale,
+    /// Display DPI scale, retained for diagnostics and UI sizing.
     pub scale: DpiScale,
+    /// Explicit conversion from screenshot pixels to DesktopPhysical units.
+    /// Older payloads fall back to `scale` for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_to_desktop_scale: Option<DpiScale>,
     pub captured_at: Option<SystemTime>,
 }
 
@@ -664,6 +676,7 @@ impl<'a> CoordinateTransform<'a> {
                 "metadata coordinate_space is not screenshot_pixel".into(),
             ));
         }
+        let scale = screenshot_pixel_scale(metadata)?;
         if point.x < 0.0
             || point.y < 0.0
             || point.x >= metadata.width as f64
@@ -674,8 +687,8 @@ impl<'a> CoordinateTransform<'a> {
             ));
         }
         Ok(Point {
-            x: metadata.desktop_origin.x + point.x,
-            y: metadata.desktop_origin.y + point.y,
+            x: metadata.desktop_origin.x + point.x / scale.x,
+            y: metadata.desktop_origin.y + point.y / scale.y,
         })
     }
 
@@ -684,9 +697,10 @@ impl<'a> CoordinateTransform<'a> {
         metadata: &ScreenshotMetadata,
         point: Point,
     ) -> Result<Point, CoordinateTransformError> {
+        let scale = screenshot_pixel_scale(metadata)?;
         let local = Point {
-            x: point.x - metadata.desktop_origin.x,
-            y: point.y - metadata.desktop_origin.y,
+            x: (point.x - metadata.desktop_origin.x) * scale.x,
+            y: (point.y - metadata.desktop_origin.y) * scale.y,
         };
         self.screenshot_to_desktop(metadata, local).map(|_| Point {
             x: local.x.round(),
@@ -760,11 +774,15 @@ impl<'a> CoordinateTransform<'a> {
         metadata: &ScreenshotMetadata,
         rect: Rect,
     ) -> Result<Rect, CoordinateTransformError> {
+        let scale = screenshot_pixel_scale(metadata)?;
         validate_screenshot_rect(metadata, rect)?;
         let origin = self.screenshot_to_desktop(metadata, rect.origin)?;
         Ok(Rect {
             origin,
-            size: rect.size,
+            size: Size {
+                width: rect.size.width / scale.x,
+                height: rect.size.height / scale.y,
+            },
         })
     }
 
@@ -773,12 +791,16 @@ impl<'a> CoordinateTransform<'a> {
         metadata: &ScreenshotMetadata,
         rect: Rect,
     ) -> Result<Rect, CoordinateTransformError> {
+        let scale = screenshot_pixel_scale(metadata)?;
         let local = Rect {
             origin: Point {
-                x: rect.origin.x - metadata.desktop_origin.x,
-                y: rect.origin.y - metadata.desktop_origin.y,
+                x: (rect.origin.x - metadata.desktop_origin.x) * scale.x,
+                y: (rect.origin.y - metadata.desktop_origin.y) * scale.y,
             },
-            size: rect.size,
+            size: Size {
+                width: rect.size.width * scale.x,
+                height: rect.size.height * scale.y,
+            },
         };
         validate_screenshot_rect(metadata, local)?;
         let left = local.origin.x.floor();
@@ -828,6 +850,14 @@ fn validate_screenshot_rect(
         ));
     }
     Ok(())
+}
+
+fn screenshot_pixel_scale(
+    metadata: &ScreenshotMetadata,
+) -> Result<DpiScale, CoordinateTransformError> {
+    let scale = metadata.pixel_to_desktop_scale.unwrap_or(metadata.scale);
+    validate_scale(scale)?;
+    Ok(scale)
 }
 
 fn union_rects(rects: Vec<Rect>) -> Option<Rect> {
@@ -1122,6 +1152,18 @@ pub enum ComputerExecutionStrategy {
     PreferPixel,
 }
 
+/// Selects whether a native backend should keep the user's desktop untouched
+/// when it has an application-scoped or Accessibility-based route available.
+/// `TakeoverOnly` is retained for compatibility and for the last-resort path
+/// required by controls that cannot be operated in the background.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerExecutionMode {
+    #[default]
+    BackgroundPreferred,
+    TakeoverOnly,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerFallbackPolicy {
@@ -1140,6 +1182,12 @@ pub enum ComputerExecutionIntent {
     Pixel {
         action: ComputerAction,
         target_window_id: Option<WindowId>,
+        /// Optional application-level target for keyboard/text input.  This
+        /// is intentionally separate from `target_window_id`: a browser can
+        /// create a new top-level window while remaining the same process,
+        /// whereas screenshot coordinates must stay bound to one window.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_application: Option<Box<ApplicationIdentity>>,
     },
 }
 
@@ -1148,6 +1196,8 @@ pub struct ComputerExecutionRequest {
     pub intent: ComputerExecutionIntent,
     pub strategy: ComputerExecutionStrategy,
     pub fallback_policy: ComputerFallbackPolicy,
+    #[serde(default)]
+    pub execution_mode: ComputerExecutionMode,
 }
 
 impl ComputerExecutionRequest {
@@ -1156,6 +1206,7 @@ impl ComputerExecutionRequest {
             intent: ComputerExecutionIntent::Semantic(action),
             strategy: ComputerExecutionStrategy::PreferSemantic,
             fallback_policy: ComputerFallbackPolicy::Deny,
+            execution_mode: ComputerExecutionMode::BackgroundPreferred,
         }
     }
 
@@ -1164,9 +1215,57 @@ impl ComputerExecutionRequest {
             intent: ComputerExecutionIntent::Pixel {
                 action,
                 target_window_id,
+                target_application: None,
             },
             strategy: ComputerExecutionStrategy::PixelOnly,
             fallback_policy: ComputerFallbackPolicy::Deny,
+            execution_mode: ComputerExecutionMode::BackgroundPreferred,
+        }
+    }
+
+    /// Construct an application-scoped keyboard/text request. The macOS
+    /// runtime delivers these events to the application's PID when possible;
+    /// other platforms retain their native foreground contract. Spatial
+    /// actions must remain window/pixel scoped and are rejected by the backend
+    /// if passed here.
+    pub fn application(action: ComputerAction, target: ApplicationIdentity) -> Self {
+        Self {
+            intent: ComputerExecutionIntent::Pixel {
+                action,
+                target_window_id: None,
+                target_application: Some(Box::new(target)),
+            },
+            strategy: ComputerExecutionStrategy::PixelOnly,
+            fallback_policy: ComputerFallbackPolicy::Deny,
+            execution_mode: ComputerExecutionMode::BackgroundPreferred,
+        }
+    }
+
+    pub fn background_preferred(mut self) -> Self {
+        self.execution_mode = ComputerExecutionMode::BackgroundPreferred;
+        self
+    }
+
+    pub fn with_execution_mode(mut self, mode: ComputerExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    pub fn takeover_only(mut self) -> Self {
+        self.execution_mode = ComputerExecutionMode::TakeoverOnly;
+        self
+    }
+
+    pub fn allows_background(&self) -> bool {
+        self.execution_mode == ComputerExecutionMode::BackgroundPreferred
+    }
+
+    pub fn target_application(&self) -> Option<&ApplicationIdentity> {
+        match &self.intent {
+            ComputerExecutionIntent::Pixel {
+                target_application, ..
+            } => target_application.as_deref(),
+            ComputerExecutionIntent::Semantic(_) => None,
         }
     }
 
@@ -1317,6 +1416,33 @@ pub enum ScrollDirection {
     Right,
 }
 
+/// A screenshot-driven pointer gesture with optional modifier keys. This is
+/// intentionally separate from the legacy actions so a computer-use batch can
+/// preserve signed scroll deltas and every drag waypoint without changing the
+/// established wire shape of the legacy Drag and Scroll actions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ComputerPointerAction {
+    Click {
+        at: Coordinate,
+        button: MouseButton,
+        clicks: u8,
+    },
+    Move {
+        to: Coordinate,
+    },
+    Drag {
+        path: Vec<Coordinate>,
+        button: MouseButton,
+    },
+    Scroll {
+        at: Coordinate,
+        /// API deltas: positive delta_y scrolls down and positive
+        /// delta_x scrolls right, matching browser computer-use semantics.
+        delta_x: i32,
+        delta_y: i32,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ComputerAction {
     Click {
@@ -1397,6 +1523,10 @@ pub enum ComputerAction {
     },
     FocusWindow {
         window_id: WindowId,
+    },
+    ModifiedPointer {
+        action: ComputerPointerAction,
+        modifiers: Vec<String>,
     },
 }
 
@@ -1529,6 +1659,32 @@ mod tests {
         assert!(serde_json::to_value(spatial).unwrap()["TypeText"]["at"].is_object());
     }
 
+    #[test]
+    fn execution_mode_defaults_to_background_and_accepts_legacy_requests() {
+        let request = ComputerExecutionRequest::pixel(
+            ComputerAction::KeyPress {
+                key: "a".into(),
+                target: None,
+            },
+            None,
+        );
+        assert_eq!(
+            request.execution_mode,
+            ComputerExecutionMode::BackgroundPreferred
+        );
+        let mut legacy = serde_json::to_value(&request).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("request is an object")
+            .remove("execution_mode");
+        let decoded: ComputerExecutionRequest = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.allows_background());
+        assert_eq!(
+            decoded.takeover_only().execution_mode,
+            ComputerExecutionMode::TakeoverOnly
+        );
+    }
+
     fn display(id: &str, origin: Point, size: Size, scale: f64, primary: bool) -> DisplayInfo {
         DisplayInfo {
             id: DisplayId::new(id),
@@ -1651,6 +1807,7 @@ mod tests {
             desktop_origin: Point { x: -1920.0, y: 0.0 },
             dpi: DpiScale::ONE,
             scale: DpiScale::ONE,
+            pixel_to_desktop_scale: Some(DpiScale::ONE),
             captured_at: None,
         };
         assert_eq!(
@@ -1664,6 +1821,108 @@ mod tests {
         );
         assert!(transform
             .screenshot_to_desktop(&metadata, Point { x: 1920.0, y: 0.0 })
+            .is_err());
+    }
+
+    #[test]
+    fn scaled_screenshot_frame_maps_pixels_to_desktop_units() {
+        let topology = DisplayTopology::from_displays(Vec::new(), 1);
+        let transform = CoordinateTransform::new(&topology);
+        let metadata = ScreenshotMetadata {
+            frame_id: FrameId::new("scaled-frame"),
+            display_id: Some(DisplayId::new("retina")),
+            width: 1920,
+            height: 1080,
+            mime_type: "image/png".into(),
+            coordinate_space: CoordinateSpace::ScreenshotPixel,
+            desktop_origin: Point { x: -960.0, y: 40.0 },
+            dpi: DpiScale { x: 192.0, y: 144.0 },
+            scale: DpiScale { x: 2.0, y: 1.5 },
+            pixel_to_desktop_scale: Some(DpiScale { x: 2.0, y: 1.5 }),
+            captured_at: None,
+        };
+
+        assert_eq!(
+            transform
+                .screenshot_to_desktop(&metadata, Point { x: 200.0, y: 150.0 })
+                .unwrap(),
+            Point {
+                x: -860.0,
+                y: 140.0
+            }
+        );
+        assert_eq!(
+            transform
+                .desktop_to_screenshot(
+                    &metadata,
+                    Point {
+                        x: -860.0,
+                        y: 140.0
+                    }
+                )
+                .unwrap(),
+            Point { x: 200.0, y: 150.0 }
+        );
+
+        let screenshot_rect = transform
+            .screenshot_rect_to_desktop(
+                &metadata,
+                Rect {
+                    origin: Point { x: 200.0, y: 150.0 },
+                    size: Size {
+                        width: 400.0,
+                        height: 300.0,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            screenshot_rect.origin,
+            Point {
+                x: -860.0,
+                y: 140.0
+            }
+        );
+        assert_eq!(
+            screenshot_rect.size,
+            Size {
+                width: 200.0,
+                height: 200.0,
+            }
+        );
+        assert_eq!(
+            transform
+                .desktop_rect_to_screenshot(&metadata, screenshot_rect)
+                .unwrap(),
+            Rect {
+                origin: Point { x: 200.0, y: 150.0 },
+                size: Size {
+                    width: 400.0,
+                    height: 300.0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn screenshot_mapping_rejects_invalid_pixel_scale() {
+        let topology = DisplayTopology::from_displays(Vec::new(), 1);
+        let transform = CoordinateTransform::new(&topology);
+        let metadata = ScreenshotMetadata {
+            frame_id: FrameId::new("invalid-scale"),
+            display_id: None,
+            width: 10,
+            height: 10,
+            mime_type: "image/png".into(),
+            coordinate_space: CoordinateSpace::ScreenshotPixel,
+            desktop_origin: Point { x: 0.0, y: 0.0 },
+            dpi: DpiScale::ONE,
+            scale: DpiScale::ONE,
+            pixel_to_desktop_scale: Some(DpiScale { x: 0.0, y: 1.0 }),
+            captured_at: None,
+        };
+        assert!(transform
+            .screenshot_to_desktop(&metadata, Point { x: 1.0, y: 1.0 })
             .is_err());
     }
 

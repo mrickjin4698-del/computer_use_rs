@@ -117,6 +117,38 @@ pub trait ComputerBackend: Send + Sync + 'static {
         let screens = self.enumerate_screens(session).await?;
         Ok(DisplayTopology::from_displays(screens, 0))
     }
+    /// Gather a coherent observation. Native backends can override this to
+    /// refresh display topology once and reuse it for windows and the frame;
+    /// the default keeps compatibility for small/test backends.
+    async fn observe(
+        &mut self,
+        session: &ComputerSessionId,
+    ) -> Result<ComputerObservation, ComputerError> {
+        let topology = self.display_topology(session).await?;
+        let screens = topology.displays.clone();
+        let windows = self.enumerate_windows(session).await?;
+        let active_window = windows
+            .iter()
+            .find(|window| window.active)
+            .map(|window| window.id.clone());
+        let primary = screens
+            .iter()
+            .find(|screen| screen.primary)
+            .map(|screen| screen.id.clone());
+        let frame = match primary {
+            Some(screen) => Some(self.capture_frame(session, &screen).await?),
+            None => None,
+        };
+        Ok(ComputerObservation {
+            session_id: session.clone(),
+            screens,
+            windows,
+            active_window,
+            screenshot: None,
+            frame,
+            display_topology: Some(topology),
+        })
+    }
     async fn screenshot_target(
         &mut self,
         session: &ComputerSessionId,
@@ -289,6 +321,20 @@ impl ComputerRuntime<WinNativeBackend> {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl ComputerRuntime<MacNativeBackend> {
+    pub async fn native_frame_store_stats(
+        &self,
+        session: &ComputerSessionId,
+    ) -> NativeFrameStoreStats {
+        self.backend.lock().await.frame_store_stats(session)
+    }
+
+    pub async fn native_desktop_identity(&self) -> Result<(String, String), ComputerError> {
+        self.backend.lock().await.desktop_identity()
+    }
+}
+
 pub struct ComputerSession<B: ComputerBackend> {
     id: ComputerSessionId,
     backend: Arc<Mutex<B>>,
@@ -320,31 +366,7 @@ impl<B: ComputerBackend> ComputerSession<B> {
 
     pub async fn observe(&self) -> Result<ComputerObservation, ComputerError> {
         self.ensure_open()?;
-        let mut backend = self.backend.lock().await;
-        let topology = backend.display_topology(&self.id).await?;
-        let screens = topology.displays.clone();
-        let windows = backend.enumerate_windows(&self.id).await?;
-        let active_window = windows
-            .iter()
-            .find(|window| window.active)
-            .map(|window| window.id.clone());
-        let primary = screens
-            .iter()
-            .find(|screen| screen.primary)
-            .map(|screen| screen.id.clone());
-        let frame = match primary {
-            Some(screen) => Some(backend.capture_frame(&self.id, &screen).await?),
-            None => None,
-        };
-        Ok(ComputerObservation {
-            session_id: self.id.clone(),
-            screens,
-            windows,
-            active_window,
-            screenshot: None,
-            frame,
-            display_topology: Some(topology),
-        })
+        self.backend.lock().await.observe(&self.id).await
     }
 
     pub async fn enumerate_screens(&self) -> Result<Vec<Screen>, ComputerError> {
@@ -532,10 +554,19 @@ pub use win_native::{
     NativeCaptureProfile, NativeDisplayInfo, NativeFrameStoreStats, NativePngMode, WinNativeBackend,
 };
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod mac_native;
+
+#[cfg(target_os = "macos")]
+pub use mac_native::{MacNativeBackend, NativeDisplayInfo, NativeFrameStoreStats};
+
+#[cfg(target_os = "macos")]
+pub type WinNativeBackend = MacNativeBackend;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct WinNativeBackend;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl WinNativeBackend {
     pub fn new() -> Self {
         Self
@@ -630,6 +661,7 @@ mod tests {
                     desktop_origin: Point { x: 0.0, y: 0.0 },
                     dpi: DpiScale::ONE,
                     scale: DpiScale::ONE,
+                    pixel_to_desktop_scale: Some(DpiScale::ONE),
                     captured_at: None,
                 },
                 bytes: vec![1],
@@ -653,6 +685,7 @@ mod tests {
                 stride: 4,
                 dpi: DpiScale::ONE,
                 scale: DpiScale::ONE,
+                pixel_to_desktop_scale: Some(DpiScale::ONE),
                 captured_at: None,
                 content_revision: 1,
                 stale_topology: false,

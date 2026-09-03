@@ -17,15 +17,15 @@ use alice_computer_use_core::{
     ComputerError, ComputerExecutionAttempt, ComputerExecutionIntent, ComputerExecutionMethod,
     ComputerExecutionOutcome, ComputerExecutionRequest, ComputerExecutionResult,
     ComputerExecutionStrategy, ComputerExecutionTiming, ComputerExecutionVerification,
-    ComputerExecutionVerificationKind, ComputerFallbackPolicy, ComputerSessionId, Coordinate,
-    CoordinateSpace, CoordinateTransform, DesktopKind, DesktopSecurityContext, DisplayId,
-    DisplayInfo, DisplayTopology, DpiScale, ElementId, FrameEncoding, FrameEncodingResult, FrameId,
-    FrameMetadataResult, FramePixelFormat, FrameState, FrameworkHint, IntegrityLevel, MouseButton,
-    PixelTarget, Point, ProcessArchitecture, ProcessSecurityContext, Rect, Screen, ScreenId,
-    Screenshot, ScreenshotMetadata, ScreenshotTarget, ScrollDirection, SecurityDecision,
-    SemanticAction, SemanticActionResult, SemanticActionStatus, SemanticObservation,
-    SemanticObservationLimits, Size, TargetAccessCapabilities, Window, WindowId,
-    WindowSecurityMetadata,
+    ComputerExecutionVerificationKind, ComputerFallbackPolicy, ComputerPointerAction,
+    ComputerSessionId, Coordinate, CoordinateSpace, CoordinateTransform, DesktopKind,
+    DesktopSecurityContext, DisplayId, DisplayInfo, DisplayTopology, DpiScale, ElementId,
+    FrameEncoding, FrameEncodingResult, FrameId, FrameMetadataResult, FramePixelFormat, FrameState,
+    FrameworkHint, IntegrityLevel, MouseButton, PixelTarget, Point, ProcessArchitecture,
+    ProcessSecurityContext, Rect, Screen, ScreenId, Screenshot, ScreenshotMetadata,
+    ScreenshotTarget, ScrollDirection, SecurityDecision, SemanticAction, SemanticActionResult,
+    SemanticActionStatus, SemanticObservation, SemanticObservationLimits, Size,
+    TargetAccessCapabilities, Window, WindowId, WindowSecurityMetadata,
 };
 use async_trait::async_trait;
 use std::{
@@ -720,6 +720,7 @@ fn screenshot_from_frame(metadata: &CaptureFrameMetadata, bytes: Vec<u8>) -> Scr
             desktop_origin: metadata.desktop_origin,
             dpi: metadata.dpi,
             scale: metadata.scale,
+            pixel_to_desktop_scale: metadata.pixel_to_desktop_scale,
             captured_at: metadata.captured_at,
         },
         bytes,
@@ -978,6 +979,20 @@ impl WinNativeBackend {
                 let (x, y, _) = self.coordinate(session, from)?;
                 unsafe { WindowFromPoint(POINT { x, y }) }
             }
+            ComputerAction::ModifiedPointer { action, .. } => {
+                let coordinate = match action {
+                    ComputerPointerAction::Click { at, .. }
+                    | ComputerPointerAction::Scroll { at, .. } => at,
+                    ComputerPointerAction::Move { to } => to,
+                    ComputerPointerAction::Drag { path, .. } => path.first().ok_or_else(|| {
+                        ComputerError::InvalidAction(
+                            "modified pointer drag requires at least two points".into(),
+                        )
+                    })?,
+                };
+                let (x, y, _) = self.coordinate(session, coordinate)?;
+                unsafe { WindowFromPoint(POINT { x, y }) }
+            }
         };
         if hwnd.0.is_null() {
             return Err(ComputerError::TargetUnavailable(format!(
@@ -1213,6 +1228,7 @@ impl WinNativeBackend {
                     desktop_origin: metadata.desktop_origin,
                     dpi: metadata.dpi,
                     scale: metadata.scale,
+                    pixel_to_desktop_scale: metadata.pixel_to_desktop_scale,
                     captured_at: metadata.captured_at,
                 };
                 let point =
@@ -1836,6 +1852,138 @@ impl WinNativeBackend {
         ))
     }
 
+    fn send_scroll_delta(
+        &self,
+        session: &ComputerSessionId,
+        coordinate: &Coordinate,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> Result<String, ComputerError> {
+        let (x, y, detail) = self.coordinate(session, coordinate)?;
+        let pointer_detail = self.move_pointer_verified(x, y)?;
+        let mut events = Vec::with_capacity(2);
+        if delta_y != 0 {
+            events.push(mouse_input_with_data(MOUSEEVENTF_WHEEL, (-delta_y) as u32));
+        }
+        if delta_x != 0 {
+            events.push(mouse_input_with_data(MOUSEEVENTF_HWHEEL, delta_x as u32));
+        }
+        unsafe {
+            send_input(&events)?;
+        }
+        Ok(format!(
+            "{detail}; {pointer_detail}; delta_x={delta_x}; delta_y={delta_y}"
+        ))
+    }
+
+    fn send_drag_path(
+        &self,
+        session: &ComputerSessionId,
+        path: &[Coordinate],
+        button: MouseButton,
+    ) -> Result<String, ComputerError> {
+        if path.len() < 2 {
+            return Err(ComputerError::InvalidAction(
+                "modified pointer drag requires at least two points".into(),
+            ));
+        }
+        let mut points = Vec::with_capacity(path.len());
+        for coordinate in path {
+            let (x, y, detail) = self.coordinate(session, coordinate)?;
+            points.push((x, y, detail));
+        }
+        let (down, up) = mouse_button_flags(button);
+        let pointer_detail = self.move_pointer_verified(points[0].0, points[0].1)?;
+        unsafe {
+            if let Err(error) = send_input(&[mouse_input(down)]) {
+                let _ = send_input(&[mouse_input(up)]);
+                return Err(error);
+            }
+            for (x, y, _) in points.iter().skip(1) {
+                let movement = self.absolute_mouse_move(*x, *y)?;
+                if let Err(error) = send_input(&[movement]) {
+                    let _ = send_input(&[mouse_input(up)]);
+                    return Err(error);
+                }
+            }
+            if let Err(error) = send_input(&[mouse_input(up)]) {
+                let _ = send_input(&[mouse_input(up)]);
+                return Err(error);
+            }
+        }
+        Ok(format!(
+            "from={} ({},{}); {pointer_detail}; waypoints={}; to={} ({},{}); button={button:?}",
+            points[0].2,
+            points[0].0,
+            points[0].1,
+            points.len(),
+            points.last().expect("path is non-empty").2,
+            points.last().expect("path is non-empty").0,
+            points.last().expect("path is non-empty").1,
+        ))
+    }
+
+    fn send_pointer_action(
+        &self,
+        session: &ComputerSessionId,
+        action: &ComputerPointerAction,
+    ) -> Result<String, ComputerError> {
+        match action {
+            ComputerPointerAction::Click { at, button, clicks } => {
+                if *clicks == 0 || *clicks > 3 {
+                    return Err(ComputerError::InvalidAction(
+                        "modified pointer click count must be between 1 and 3".into(),
+                    ));
+                }
+                self.send_mouse_button(session, at, *button, u32::from(*clicks))
+            }
+            ComputerPointerAction::Move { to } => self.send_pointer_move(session, to),
+            ComputerPointerAction::Drag { path, button } => {
+                self.send_drag_path(session, path, *button)
+            }
+            ComputerPointerAction::Scroll {
+                at,
+                delta_x,
+                delta_y,
+            } => self.send_scroll_delta(session, at, *delta_x, *delta_y),
+        }
+    }
+
+    fn send_modified_pointer(
+        &self,
+        session: &ComputerSessionId,
+        action: &ComputerPointerAction,
+        modifiers: &[String],
+    ) -> Result<String, ComputerError> {
+        if modifiers.is_empty() {
+            return self.send_pointer_action(session, action);
+        }
+        let mut pressed = 0usize;
+        for modifier in modifiers {
+            if let Err(error) = self.send_key_transition(modifier, true) {
+                for previous in modifiers[..pressed].iter().rev() {
+                    let _ = self.send_key_transition(previous, false);
+                }
+                return Err(error);
+            }
+            pressed += 1;
+        }
+        let action_result = self.send_pointer_action(session, action);
+        let mut release_error = None;
+        for modifier in modifiers[..pressed].iter().rev() {
+            if let Err(error) = self.send_key_transition(modifier, false) {
+                release_error.get_or_insert(error);
+            }
+        }
+        if let Err(error) = action_result {
+            return Err(error);
+        }
+        if let Some(error) = release_error {
+            return Err(error);
+        }
+        Ok(format!("modifiers={modifiers:?}; transaction=true"))
+    }
+
     pub fn capture_primary_profile(
         &self,
         png_mode: NativePngMode,
@@ -1876,6 +2024,7 @@ impl WinNativeBackend {
                     desktop_origin: info.monitor.origin,
                     dpi: info.dpi,
                     scale: info.scale,
+                    pixel_to_desktop_scale: Some(DpiScale::ONE),
                     captured_at: Some(SystemTime::now()),
                 },
                 bytes,
@@ -1933,6 +2082,9 @@ impl WinNativeBackend {
             desktop_origin: display.physical_bounds.origin,
             dpi: display.dpi,
             scale: display.scale,
+            // The Windows backend is per-monitor DPI aware and GDI returns
+            // physical pixels in the same DesktopPhysical coordinate space.
+            pixel_to_desktop_scale: Some(DpiScale::ONE),
             width: gdi.width,
             height: gdi.height,
             pixel_format: FramePixelFormat::Bgra8,
@@ -2245,6 +2397,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
         ComputerAction::KeyDown { .. } => "key_down",
         ComputerAction::KeyUp { .. } => "key_up",
         ComputerAction::HoldKey { .. } => "hold_key",
+        ComputerAction::ModifiedPointer { .. } => "modified_pointer",
     }
 }
 
@@ -2657,6 +2810,35 @@ impl ComputerBackend for WinNativeBackend {
         Ok(self.topology()?.topology.clone())
     }
 
+    async fn observe(
+        &mut self,
+        session: &ComputerSessionId,
+    ) -> Result<alice_computer_use_core::ComputerObservation, ComputerError> {
+        self.refresh_topology()?;
+        let topology = self.topology()?.topology.clone();
+        let screens = topology.displays.clone();
+        let display = self.primary_display_info()?;
+        let windows = self.enumerate_window_records(&display)?;
+        let active_window = windows
+            .iter()
+            .find(|window| window.active)
+            .map(|window| window.id.clone());
+        let frame = topology
+            .primary_display_id
+            .clone()
+            .map(|display_id| self.capture_display_frame(session, &display_id))
+            .transpose()?;
+        Ok(alice_computer_use_core::ComputerObservation {
+            session_id: session.clone(),
+            screens,
+            windows,
+            active_window,
+            screenshot: None,
+            frame,
+            display_topology: Some(topology),
+        })
+    }
+
     async fn enumerate_windows(
         &mut self,
         _session: &ComputerSessionId,
@@ -2917,6 +3099,10 @@ impl ComputerBackend for WinNativeBackend {
                     }
                 }
             }
+            ComputerAction::ModifiedPointer { action, modifiers } => (
+                self.send_modified_pointer(session, action, modifiers)?,
+                "modified_pointer",
+            ),
         };
         Ok(ComputerActionResult {
             status: ActionStatus::Performed,
@@ -4199,6 +4385,7 @@ mod frame_store_tests {
                 stride: 4,
                 dpi: DpiScale::ONE,
                 scale: DpiScale::ONE,
+                pixel_to_desktop_scale: Some(DpiScale::ONE),
                 captured_at: None,
                 content_revision: generation,
                 stale_topology: false,
