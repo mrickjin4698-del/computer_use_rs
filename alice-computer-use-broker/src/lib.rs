@@ -2776,6 +2776,7 @@ mod tests {
         Window {
             id: WindowId::new(id),
             title: id.to_owned(),
+            class_name: None,
             process_id: None,
             bounds: Coordinate {
                 space: CoordinateSpace::DesktopPhysical,

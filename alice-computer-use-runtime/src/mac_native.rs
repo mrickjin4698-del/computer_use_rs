@@ -5153,6 +5153,7 @@ fn public_windows(records: Vec<WindowRecord>, topology: &DisplayTopology) -> Vec
         .map(|window| Window {
             id: window.id,
             title: window.title,
+            class_name: None,
             process_id: Some(window.process_id),
             bounds: Coordinate {
                 space: CoordinateSpace::DesktopPhysical,

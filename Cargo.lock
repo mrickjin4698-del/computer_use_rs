@@ -26,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "alice-computer-use-broker",
  "alice-computer-use-core",
+ "alice-computer-use-runtime",
  "alice-computer-use-sidecar-client",
  "base64",
  "png",
