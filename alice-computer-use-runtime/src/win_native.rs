@@ -424,22 +424,36 @@ impl PixelAttemptResult {
 
 unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = &mut *(lparam.0 as *mut WindowEnumState);
-    if !IsWindowVisible(hwnd).as_bool() {
+    let is_foreground = hwnd == state.foreground;
+    // Shell popups can briefly report as non-visible while the compositor is
+    // handing foreground ownership from the Alice window to Start. Preserve
+    // the foreground record during that transition; dropping it is what made
+    // the later broker probe see an empty active window.
+    if !IsWindowVisible(hwnd).as_bool() && !is_foreground {
         return BOOL(1);
     }
+    if let Some(window) = window_record(hwnd, state.foreground, &state.topology) {
+        state.windows.push(window);
+    }
+    BOOL(1)
+}
+
+unsafe fn window_record(
+    hwnd: HWND,
+    foreground: HWND,
+    topology: &DisplayTopology,
+) -> Option<Window> {
     let mut rect = RECT::default();
-    if GetWindowRect(hwnd, &mut rect).is_err() {
-        return BOOL(1);
-    }
+    GetWindowRect(hwnd, &mut rect).ok()?;
     let title_len = GetWindowTextLengthW(hwnd).max(0) as usize;
     let mut title_buffer = vec![0u16; title_len.saturating_add(1).max(1)];
     let title_chars = GetWindowTextW(hwnd, &mut title_buffer).max(0) as usize;
     let title = String::from_utf16_lossy(&title_buffer[..title_chars.min(title_buffer.len())]);
+    let class_name = window_class_name(hwnd);
     let mut process_id = 0u32;
     let _ = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
     let bounds = core_rect(rect);
-    let display_id = state
-        .topology
+    let display_id = topology
         .displays
         .iter()
         .filter(|display| intersects(bounds, display.physical_bounds))
@@ -449,9 +463,10 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|display| display.id.clone());
-    state.windows.push(Window {
+    Some(Window {
         id: WindowId::new((hwnd.0 as isize).to_string()),
         title,
+        class_name,
         process_id: (process_id != 0).then_some(process_id),
         bounds: Coordinate {
             space: CoordinateSpace::DesktopPhysical,
@@ -462,10 +477,9 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             frame_id: None,
         },
         screen_id: display_id,
-        active: hwnd == state.foreground,
+        active: hwnd == foreground,
         security: None,
-    });
-    BOOL(1)
+    })
 }
 
 fn core_rect(rect: RECT) -> Rect {
@@ -1051,6 +1065,15 @@ impl WinNativeBackend {
         let hwnd = Self::hwnd(window_id)?;
         unsafe {
             let before = GetForegroundWindow();
+            // Electron runs the Runtime bridge in a background sidecar
+            // process. If the approval UI did not change the foreground,
+            // calling SetForegroundWindow again can be rejected by the
+            // Windows foreground-lock policy even though the requested
+            // focus is already satisfied. Preserve the existing safety
+            // admission and treat the verified foreground as success.
+            if before == hwnd {
+                return Ok(hwnd);
+            }
             let was_minimized = IsIconic(hwnd).as_bool();
             if was_minimized {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -1322,6 +1345,27 @@ impl WinNativeBackend {
         ))
     }
 
+    /// The Windows key changes the foreground surface asynchronously. Return
+    /// a compact probe in the action detail so the model can distinguish
+    /// "input dispatched" from "Start/Desktop actually became foreground"
+    /// without paying for a full screenshot or UIA walk on every key press.
+    fn shell_transition_probe(&self) -> String {
+        thread::sleep(Duration::from_millis(60));
+        let hwnd = unsafe { GetForegroundWindow() };
+        let class_name = if hwnd.0.is_null() {
+            None
+        } else {
+            window_class_name(hwnd)
+        };
+        let surface = class_name.as_deref().and_then(native_shell_surface);
+        format!(
+            "shell_transition_probe=true; foreground_hwnd={}; foreground_class={:?}; foreground_surface={:?}",
+            if hwnd.0.is_null() { 0 } else { hwnd.0 as isize },
+            class_name,
+            surface,
+        )
+    }
+
     fn send_hotkey(&self, keys: &[String]) -> Result<String, ComputerError> {
         if keys.len() < 2 {
             return Err(ComputerError::InvalidAction(
@@ -1561,6 +1605,22 @@ impl WinNativeBackend {
                 LPARAM((&mut state as *mut WindowEnumState) as isize),
             )
             .map_err(|error| ComputerError::Backend(format!("EnumWindows failed: {error}")))?;
+        }
+        // GetForegroundWindow is authoritative, but the foreground shell
+        // popup can be a transient/non-enumerated HWND during the Start-menu
+        // transition. Keep a validated fallback record so the model and the
+        // broker agree on one target instead of reporting active_window=null.
+        if !state.foreground.0.is_null()
+            && !state
+                .windows
+                .iter()
+                .any(|window| window.id.as_str() == (state.foreground.0 as isize).to_string())
+        {
+            if let Some(window) =
+                unsafe { window_record(state.foreground, state.foreground, &state.topology) }
+            {
+                state.windows.push(window);
+            }
         }
         Ok(state
             .windows
@@ -1975,9 +2035,7 @@ impl WinNativeBackend {
                 release_error.get_or_insert(error);
             }
         }
-        if let Err(error) = action_result {
-            return Err(error);
-        }
+        action_result?;
         if let Some(error) = release_error {
             return Err(error);
         }
@@ -2500,7 +2558,7 @@ impl WinNativeBackend {
                 "pixel target window disappeared before click".into(),
             );
         };
-        if !window.active {
+        if !pixel_foreground_admitted(window.active, window_id, action) {
             return PixelAttemptResult::error(
                 ComputerExecutionOutcome::FocusDenied,
                 "pixel target window is not foreground; pointer action rejected".into(),
@@ -2518,6 +2576,50 @@ impl WinNativeBackend {
         let dispatch_detail = executed
             .backend_detail
             .unwrap_or_else(|| "backend dispatch completed without detail".into());
+        if matches!(action, ComputerAction::FocusWindow { .. }) {
+            let windows = match self.enumerate_window_records(display) {
+                Ok(windows) => windows,
+                Err(error) => {
+                    return PixelAttemptResult {
+                        outcome: ComputerExecutionOutcome::OutcomeUnknown,
+                        verification: ComputerExecutionVerification {
+                            kind: Some(ComputerExecutionVerificationKind::Focused),
+                            detail: Some(format!(
+                                "focus action was dispatched but foreground verification failed: {error}"
+                            )),
+                            ..Default::default()
+                        },
+                        generation_after: None,
+                        verification_ms: 0,
+                        detail: Some("focus action outcome could not be verified".into()),
+                    };
+                }
+            };
+            let focused = windows
+                .iter()
+                .any(|window| window.id == *window_id && window.active);
+            return PixelAttemptResult {
+                outcome: if focused {
+                    ComputerExecutionOutcome::Performed
+                } else {
+                    ComputerExecutionOutcome::VerificationFailed
+                },
+                verification: ComputerExecutionVerification {
+                    kind: Some(ComputerExecutionVerificationKind::Focused),
+                    verified: focused,
+                    focused: Some(focused),
+                    detail: Some(if focused {
+                        "target window is foreground after focus action".into()
+                    } else {
+                        "focus action was dispatched but target window is not foreground".into()
+                    }),
+                    ..Default::default()
+                },
+                generation_after: None,
+                verification_ms: 0,
+                detail: Some(dispatch_detail),
+            };
+        }
         if external_input_action_requires_fixture_evidence(action) {
             return PixelAttemptResult {
                 outcome: ComputerExecutionOutcome::Performed,
@@ -3003,11 +3105,23 @@ impl ComputerBackend for WinNativeBackend {
             }
             ComputerAction::KeyPress { key, target } => {
                 self.foreground_target(target.as_ref())?;
-                (self.send_key(key)?, "key_press")
+                let detail = self.send_key(key)?;
+                let detail = if is_windows_key_name(key) {
+                    format!("{detail}; {}", self.shell_transition_probe())
+                } else {
+                    detail
+                };
+                (detail, "key_press")
             }
             ComputerAction::Hotkey { keys, target } => {
                 self.foreground_target(target.as_ref())?;
-                (self.send_hotkey(keys)?, "hotkey")
+                let detail = self.send_hotkey(keys)?;
+                let detail = if keys.iter().any(|key| is_windows_key_name(key)) {
+                    format!("{detail}; {}", self.shell_transition_probe())
+                } else {
+                    detail
+                };
+                (detail, "hotkey")
             }
             ComputerAction::MouseDown { button, at, target } => {
                 self.foreground_target(target.as_ref())?;
@@ -3526,6 +3640,7 @@ impl ComputerBackend for WinNativeBackend {
             ComputerExecutionIntent::Pixel {
                 action,
                 target_window_id,
+                ..
             } => {
                 if request.strategy == ComputerExecutionStrategy::SemanticOnly {
                     final_outcome = ComputerExecutionOutcome::InvalidRequest;
@@ -3868,6 +3983,38 @@ fn window_class_name(hwnd: HWND) -> Option<String> {
     let mut buffer = [0u16; 256];
     let length = unsafe { GetClassNameW(hwnd, &mut buffer) };
     (length > 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+}
+
+// Focus is the only action allowed to establish foreground ownership. It must
+// refer to the same window that passed target admission.
+fn pixel_foreground_admitted(active: bool, window_id: &WindowId, action: &ComputerAction) -> bool {
+    match action {
+        ComputerAction::FocusWindow {
+            window_id: focus_target,
+        } => focus_target == window_id,
+        _ => active,
+    }
+}
+
+fn is_windows_key_name(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "win" | "windows" | "meta" | "cmd" | "command"
+    )
+}
+
+fn native_shell_surface(class_name: &str) -> Option<&'static str> {
+    match class_name.trim().to_ascii_lowercase().as_str() {
+        "shell_traywnd" | "shell_secondarytraywnd" => Some("taskbar"),
+        "progman" | "workerw" => Some("desktop"),
+        "windows.ui.core.corewindow"
+        | "applicationframewindow"
+        | "xamlexplorerhostislandwindow"
+        | "xaml_windowedpopup"
+        | "xaml_windowedpopupclass"
+        | "windows.ui.input.inkingwindowclass" => Some("start_or_shell_menu"),
+        _ => None,
+    }
 }
 
 fn process_image_path(process_id: u32) -> Option<String> {
@@ -4546,6 +4693,49 @@ mod frame_store_tests {
         assert!(backend.capability_cache.contains_key(&session));
         backend.close_session(&session).await.unwrap();
         assert!(!backend.capability_cache.contains_key(&session));
+    }
+
+    #[test]
+    fn focus_can_establish_foreground_only_for_the_admitted_target() {
+        let target = WindowId::new("target");
+        let focus = ComputerAction::FocusWindow {
+            window_id: target.clone(),
+        };
+        assert!(pixel_foreground_admitted(false, &target, &focus));
+        assert!(!pixel_foreground_admitted(
+            false,
+            &WindowId::new("other"),
+            &focus
+        ));
+        assert!(!pixel_foreground_admitted(
+            true,
+            &WindowId::new("other"),
+            &focus
+        ));
+        let key = ComputerAction::KeyPress {
+            key: "Enter".into(),
+            target: Some(target.clone()),
+        };
+        assert!(!pixel_foreground_admitted(false, &target, &key));
+        assert!(pixel_foreground_admitted(true, &target, &key));
+    }
+
+    #[test]
+    fn shell_surface_and_windows_key_detection_are_bounded() {
+        assert!(is_windows_key_name("WIN"));
+        assert!(is_windows_key_name("Meta"));
+        assert!(!is_windows_key_name("ALT"));
+        assert_eq!(native_shell_surface("Shell_TrayWnd"), Some("taskbar"));
+        assert_eq!(native_shell_surface("WorkerW"), Some("desktop"));
+        assert_eq!(
+            native_shell_surface("Windows.UI.Core.CoreWindow"),
+            Some("start_or_shell_menu")
+        );
+        assert_eq!(
+            native_shell_surface("Xaml_WindowedPopupClass"),
+            Some("start_or_shell_menu")
+        );
+        assert_eq!(native_shell_surface("Chrome_WidgetWin_1"), None);
     }
 }
 

@@ -2491,7 +2491,16 @@ mod tests {
             false,
             ComputerExecutionMode::BackgroundPreferred,
         );
-        assert_eq!(typed.target_application(), Some(&application));
+        if cfg!(target_os = "macos") {
+            assert_eq!(typed.target_application(), Some(&application));
+        } else {
+            assert!(typed.target_application().is_none());
+            assert!(matches!(
+                &typed.intent,
+                ComputerExecutionIntent::Pixel { target_window_id: Some(id), .. }
+                    if id == &WindowId::new("old-window")
+            ));
+        }
 
         let shortcut = batch_execution_request(
             ComputerAction::Hotkey {

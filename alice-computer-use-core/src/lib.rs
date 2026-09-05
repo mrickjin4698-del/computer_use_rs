@@ -242,6 +242,11 @@ pub struct FrameMetadataResult {
 pub struct Window {
     pub id: WindowId,
     pub title: String,
+    /// Win32 class name when the backend can provide it. This is intentionally
+    /// descriptive metadata: it is useful for selecting shell surfaces such
+    /// as the taskbar without exposing an HWND as a separate capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
     pub process_id: Option<u32>,
     /// Top-level window frame in DesktopPhysical coordinates.
     pub bounds: Coordinate,
@@ -2100,5 +2105,29 @@ mod tests {
             profile.input.keyboard.provenance.source,
             CapabilitySource::SecurityPolicy
         );
+    }
+
+    #[test]
+    fn window_class_metadata_is_backward_compatible() {
+        let legacy = serde_json::json!({
+            "id": "window-1", "title": "Example", "process_id": 123,
+            "bounds": {
+                "space": "desktop_physical",
+                "point": {"x": 0.0, "y": 0.0},
+                "extent": {"width": 100.0, "height": 100.0},
+                "dpi": {"x": 1.0, "y": 1.0}
+            },
+            "screen_id": null, "active": true, "security": null
+        });
+        let mut window: Window = serde_json::from_value(legacy).unwrap();
+        assert_eq!(window.class_name, None);
+        assert!(serde_json::to_value(&window)
+            .unwrap()
+            .get("class_name")
+            .is_none());
+        window.class_name = Some("Shell_TrayWnd".into());
+        let round_trip: Window =
+            serde_json::from_value(serde_json::to_value(&window).unwrap()).unwrap();
+        assert_eq!(round_trip.class_name.as_deref(), Some("Shell_TrayWnd"));
     }
 }

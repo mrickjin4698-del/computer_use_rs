@@ -309,6 +309,7 @@ mod tests {
         let mut window = Window {
             id: WindowId::new("host-window"),
             title: "Alice".into(),
+            class_name: None,
             process_id: Some(std::process::id()),
             bounds: Coordinate {
                 space: CoordinateSpace::DesktopPhysical,
