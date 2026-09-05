@@ -682,7 +682,7 @@ fn encode_bgra_png_with_mode(
     let conversion_started = Instant::now();
     let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
     for row in bgra.chunks(stride as usize).take(height as usize) {
-        for pixel in row[..width as usize * 4].chunks_exact(4) {
+        for pixel in row[..width as usize * 4].as_chunks::<4>().0 {
             rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
         }
     }
