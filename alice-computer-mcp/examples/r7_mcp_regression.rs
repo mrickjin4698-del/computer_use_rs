@@ -96,13 +96,14 @@ fn main() -> Result<()> {
         "computer_health",
         "computer_observe",
         "computer_execute",
+        "computer_use",
         "computer_screenshot",
         "computer_validate",
     ];
     if names != expected {
         return Err(format!("MCP tool surface changed: {names:?}").into());
     }
-    println!("gate10.tools=PASS count=5 names={names:?}");
+    println!("gate10.tools=PASS count=6 names={names:?}");
 
     let observe = mcp.tool("computer_observe", json!({"screenshot_metadata": true}))?;
     let structured = observe
@@ -121,6 +122,34 @@ fn main() -> Result<()> {
     println!(
         "gate4/6.observe=PASS frame_id={} raw_format=bgra8 encode_count=0 explicit_frame_metadata=true",
         frame["frame_id"]
+    );
+
+    let width = frame["width"].as_u64().ok_or("frame width missing")?;
+    let height = frame["height"].as_u64().ok_or("frame height missing")?;
+    let move_result = mcp.tool(
+        "computer_use",
+        json!({
+            "actions": [{
+                "type": "move",
+                "x": width as f64 / 2.0,
+                "y": height as f64 / 2.0
+            }],
+            "include_screenshot": false
+        }),
+    )?;
+    if move_result["isError"] == true
+        || move_result["structuredContent"]["actions"][0]["outcome"] != "performed"
+        || move_result["structuredContent"]["coordinate_frame_id"]
+            .as_str()
+            .is_none()
+    {
+        return Err(format!("pixel coordinate regression failed: {move_result}").into());
+    }
+    println!(
+        "gate10.pixel_move=PASS coordinate_frame_id={} normalized_point=({}, {}) screenshot=false",
+        move_result["structuredContent"]["coordinate_frame_id"],
+        width / 2,
+        height / 2
     );
 
     let screenshot = mcp.tool("computer_screenshot", json!({}))?;

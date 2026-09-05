@@ -17,15 +17,15 @@ use alice_computer_use_core::{
     ComputerError, ComputerExecutionAttempt, ComputerExecutionIntent, ComputerExecutionMethod,
     ComputerExecutionOutcome, ComputerExecutionRequest, ComputerExecutionResult,
     ComputerExecutionStrategy, ComputerExecutionTiming, ComputerExecutionVerification,
-    ComputerExecutionVerificationKind, ComputerFallbackPolicy, ComputerSessionId, Coordinate,
-    CoordinateSpace, CoordinateTransform, DesktopKind, DesktopSecurityContext, DisplayId,
-    DisplayInfo, DisplayTopology, DpiScale, ElementId, FrameEncoding, FrameEncodingResult, FrameId,
-    FrameMetadataResult, FramePixelFormat, FrameState, FrameworkHint, IntegrityLevel, MouseButton,
-    PixelTarget, Point, ProcessArchitecture, ProcessSecurityContext, Rect, Screen, ScreenId,
-    Screenshot, ScreenshotMetadata, ScreenshotTarget, ScrollDirection, SecurityDecision,
-    SemanticAction, SemanticActionResult, SemanticActionStatus, SemanticObservation,
-    SemanticObservationLimits, Size, TargetAccessCapabilities, Window, WindowId,
-    WindowSecurityMetadata,
+    ComputerExecutionVerificationKind, ComputerFallbackPolicy, ComputerPointerAction,
+    ComputerSessionId, Coordinate, CoordinateSpace, CoordinateTransform, DesktopKind,
+    DesktopSecurityContext, DisplayId, DisplayInfo, DisplayTopology, DpiScale, ElementId,
+    FrameEncoding, FrameEncodingResult, FrameId, FrameMetadataResult, FramePixelFormat, FrameState,
+    FrameworkHint, IntegrityLevel, MouseButton, PixelTarget, Point, ProcessArchitecture,
+    ProcessSecurityContext, Rect, Screen, ScreenId, Screenshot, ScreenshotMetadata,
+    ScreenshotTarget, ScrollDirection, SecurityDecision, SemanticAction, SemanticActionResult,
+    SemanticActionStatus, SemanticObservation, SemanticObservationLimits, Size,
+    TargetAccessCapabilities, Window, WindowId, WindowSecurityMetadata,
 };
 use async_trait::async_trait;
 use std::{
@@ -50,8 +50,8 @@ use windows::Win32::{
     },
     System::{
         StationsAndDesktops::{
-            GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_ACCESS_FLAGS,
-            DESKTOP_CONTROL_FLAGS, UOI_NAME,
+            GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
+            DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
         },
         Threading::{
             AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
@@ -424,22 +424,36 @@ impl PixelAttemptResult {
 
 unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = &mut *(lparam.0 as *mut WindowEnumState);
-    if !IsWindowVisible(hwnd).as_bool() {
+    let is_foreground = hwnd == state.foreground;
+    // Shell popups can briefly report as non-visible while the compositor is
+    // handing foreground ownership from the Alice window to Start. Preserve
+    // the foreground record during that transition; dropping it is what made
+    // the later broker probe see an empty active window.
+    if !IsWindowVisible(hwnd).as_bool() && !is_foreground {
         return BOOL(1);
     }
+    if let Some(window) = window_record(hwnd, state.foreground, &state.topology) {
+        state.windows.push(window);
+    }
+    BOOL(1)
+}
+
+unsafe fn window_record(
+    hwnd: HWND,
+    foreground: HWND,
+    topology: &DisplayTopology,
+) -> Option<Window> {
     let mut rect = RECT::default();
-    if GetWindowRect(hwnd, &mut rect).is_err() {
-        return BOOL(1);
-    }
+    GetWindowRect(hwnd, &mut rect).ok()?;
     let title_len = GetWindowTextLengthW(hwnd).max(0) as usize;
     let mut title_buffer = vec![0u16; title_len.saturating_add(1).max(1)];
     let title_chars = GetWindowTextW(hwnd, &mut title_buffer).max(0) as usize;
     let title = String::from_utf16_lossy(&title_buffer[..title_chars.min(title_buffer.len())]);
+    let class_name = window_class_name(hwnd);
     let mut process_id = 0u32;
     let _ = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
     let bounds = core_rect(rect);
-    let display_id = state
-        .topology
+    let display_id = topology
         .displays
         .iter()
         .filter(|display| intersects(bounds, display.physical_bounds))
@@ -449,9 +463,10 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|display| display.id.clone());
-    state.windows.push(Window {
+    Some(Window {
         id: WindowId::new((hwnd.0 as isize).to_string()),
         title,
+        class_name,
         process_id: (process_id != 0).then_some(process_id),
         bounds: Coordinate {
             space: CoordinateSpace::DesktopPhysical,
@@ -462,10 +477,9 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             frame_id: None,
         },
         screen_id: display_id,
-        active: hwnd == state.foreground,
+        active: hwnd == foreground,
         security: None,
-    });
-    BOOL(1)
+    })
 }
 
 fn core_rect(rect: RECT) -> Rect {
@@ -668,7 +682,7 @@ fn encode_bgra_png_with_mode(
     let conversion_started = Instant::now();
     let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
     for row in bgra.chunks(stride as usize).take(height as usize) {
-        for pixel in row[..width as usize * 4].chunks_exact(4) {
+        for pixel in row[..width as usize * 4].as_chunks::<4>().0 {
             rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
         }
     }
@@ -720,6 +734,7 @@ fn screenshot_from_frame(metadata: &CaptureFrameMetadata, bytes: Vec<u8>) -> Scr
             desktop_origin: metadata.desktop_origin,
             dpi: metadata.dpi,
             scale: metadata.scale,
+            pixel_to_desktop_scale: metadata.pixel_to_desktop_scale,
             captured_at: metadata.captured_at,
         },
         bytes,
@@ -755,6 +770,49 @@ impl WinNativeBackend {
             frames: HashMap::new(),
             self_security: None,
             capability_cache: HashMap::new(),
+        }
+    }
+
+    /// Move a broker process launched from a Codex sandbox desktop onto the
+    /// logged-in user's interactive desktop before worker threads are created.
+    ///
+    /// Codex may start an MCP child on a per-task desktop (for example,
+    /// `CodexSandboxDesktop-*`) while the input desktop remains `Default`.
+    /// New threads inherit the desktop of their creator, so doing this before
+    /// the Tokio runtime starts lets the sidecar observe and control the same
+    /// desktop as Alice Electron. We only attach to the conventional `Default`
+    /// desktop; secure desktops such as Winlogon or ScreenSaver remain
+    /// protected and return `false`.
+    pub fn attach_to_input_desktop() -> Result<bool, ComputerError> {
+        unsafe {
+            let current = GetThreadDesktop(GetCurrentThreadId()).map_err(|error| {
+                ComputerError::SecurityContextUnavailable(format!(
+                    "GetThreadDesktop failed: {error}"
+                ))
+            })?;
+            let input = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(1))
+                .map_err(|error| {
+                    ComputerError::SecurityContextUnavailable(format!(
+                        "OpenInputDesktop failed: {error}"
+                    ))
+                })?;
+            let current_name = desktop_name(HANDLE(current.0))?;
+            let input_name = desktop_name(HANDLE(input.0))?;
+            let should_attach = !current_name.eq_ignore_ascii_case(&input_name)
+                && input_name.eq_ignore_ascii_case("Default");
+            if should_attach {
+                let result = SetThreadDesktop(input);
+                let _ = windows::Win32::System::StationsAndDesktops::CloseDesktop(input);
+                result.map_err(|error| {
+                    ComputerError::SecurityContextUnavailable(format!(
+                        "SetThreadDesktop(Default) failed: {error}"
+                    ))
+                })?;
+                Ok(true)
+            } else {
+                let _ = windows::Win32::System::StationsAndDesktops::CloseDesktop(input);
+                Ok(false)
+            }
         }
     }
 
@@ -978,6 +1036,20 @@ impl WinNativeBackend {
                 let (x, y, _) = self.coordinate(session, from)?;
                 unsafe { WindowFromPoint(POINT { x, y }) }
             }
+            ComputerAction::ModifiedPointer { action, .. } => {
+                let coordinate = match action {
+                    ComputerPointerAction::Click { at, .. }
+                    | ComputerPointerAction::Scroll { at, .. } => at,
+                    ComputerPointerAction::Move { to } => to,
+                    ComputerPointerAction::Drag { path, .. } => path.first().ok_or_else(|| {
+                        ComputerError::InvalidAction(
+                            "modified pointer drag requires at least two points".into(),
+                        )
+                    })?,
+                };
+                let (x, y, _) = self.coordinate(session, coordinate)?;
+                unsafe { WindowFromPoint(POINT { x, y }) }
+            }
         };
         if hwnd.0.is_null() {
             return Err(ComputerError::TargetUnavailable(format!(
@@ -1036,6 +1108,15 @@ impl WinNativeBackend {
         let hwnd = Self::hwnd(window_id)?;
         unsafe {
             let before = GetForegroundWindow();
+            // Electron runs the Runtime bridge in a background sidecar
+            // process. If the approval UI did not change the foreground,
+            // calling SetForegroundWindow again can be rejected by the
+            // Windows foreground-lock policy even though the requested
+            // focus is already satisfied. Preserve the existing safety
+            // admission and treat the verified foreground as success.
+            if before == hwnd {
+                return Ok(hwnd);
+            }
             let was_minimized = IsIconic(hwnd).as_bool();
             if was_minimized {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -1213,6 +1294,7 @@ impl WinNativeBackend {
                     desktop_origin: metadata.desktop_origin,
                     dpi: metadata.dpi,
                     scale: metadata.scale,
+                    pixel_to_desktop_scale: metadata.pixel_to_desktop_scale,
                     captured_at: metadata.captured_at,
                 };
                 let point =
@@ -1304,6 +1386,27 @@ impl WinNativeBackend {
             "virtual_key=0x{:02x}; physical_scancode=true",
             key.0
         ))
+    }
+
+    /// The Windows key changes the foreground surface asynchronously. Return
+    /// a compact probe in the action detail so the model can distinguish
+    /// "input dispatched" from "Start/Desktop actually became foreground"
+    /// without paying for a full screenshot or UIA walk on every key press.
+    fn shell_transition_probe(&self) -> String {
+        thread::sleep(Duration::from_millis(60));
+        let hwnd = unsafe { GetForegroundWindow() };
+        let class_name = if hwnd.0.is_null() {
+            None
+        } else {
+            window_class_name(hwnd)
+        };
+        let surface = class_name.as_deref().and_then(native_shell_surface);
+        format!(
+            "shell_transition_probe=true; foreground_hwnd={}; foreground_class={:?}; foreground_surface={:?}",
+            if hwnd.0.is_null() { 0 } else { hwnd.0 as isize },
+            class_name,
+            surface,
+        )
     }
 
     fn send_hotkey(&self, keys: &[String]) -> Result<String, ComputerError> {
@@ -1545,6 +1648,22 @@ impl WinNativeBackend {
                 LPARAM((&mut state as *mut WindowEnumState) as isize),
             )
             .map_err(|error| ComputerError::Backend(format!("EnumWindows failed: {error}")))?;
+        }
+        // GetForegroundWindow is authoritative, but the foreground shell
+        // popup can be a transient/non-enumerated HWND during the Start-menu
+        // transition. Keep a validated fallback record so the model and the
+        // broker agree on one target instead of reporting active_window=null.
+        if !state.foreground.0.is_null()
+            && !state
+                .windows
+                .iter()
+                .any(|window| window.id.as_str() == (state.foreground.0 as isize).to_string())
+        {
+            if let Some(window) =
+                unsafe { window_record(state.foreground, state.foreground, &state.topology) }
+            {
+                state.windows.push(window);
+            }
         }
         Ok(state
             .windows
@@ -1836,6 +1955,136 @@ impl WinNativeBackend {
         ))
     }
 
+    fn send_scroll_delta(
+        &self,
+        session: &ComputerSessionId,
+        coordinate: &Coordinate,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> Result<String, ComputerError> {
+        let (x, y, detail) = self.coordinate(session, coordinate)?;
+        let pointer_detail = self.move_pointer_verified(x, y)?;
+        let mut events = Vec::with_capacity(2);
+        if delta_y != 0 {
+            events.push(mouse_input_with_data(MOUSEEVENTF_WHEEL, (-delta_y) as u32));
+        }
+        if delta_x != 0 {
+            events.push(mouse_input_with_data(MOUSEEVENTF_HWHEEL, delta_x as u32));
+        }
+        unsafe {
+            send_input(&events)?;
+        }
+        Ok(format!(
+            "{detail}; {pointer_detail}; delta_x={delta_x}; delta_y={delta_y}"
+        ))
+    }
+
+    fn send_drag_path(
+        &self,
+        session: &ComputerSessionId,
+        path: &[Coordinate],
+        button: MouseButton,
+    ) -> Result<String, ComputerError> {
+        if path.len() < 2 {
+            return Err(ComputerError::InvalidAction(
+                "modified pointer drag requires at least two points".into(),
+            ));
+        }
+        let mut points = Vec::with_capacity(path.len());
+        for coordinate in path {
+            let (x, y, detail) = self.coordinate(session, coordinate)?;
+            points.push((x, y, detail));
+        }
+        let (down, up) = mouse_button_flags(button);
+        let pointer_detail = self.move_pointer_verified(points[0].0, points[0].1)?;
+        unsafe {
+            if let Err(error) = send_input(&[mouse_input(down)]) {
+                let _ = send_input(&[mouse_input(up)]);
+                return Err(error);
+            }
+            for (x, y, _) in points.iter().skip(1) {
+                let movement = self.absolute_mouse_move(*x, *y)?;
+                if let Err(error) = send_input(&[movement]) {
+                    let _ = send_input(&[mouse_input(up)]);
+                    return Err(error);
+                }
+            }
+            if let Err(error) = send_input(&[mouse_input(up)]) {
+                let _ = send_input(&[mouse_input(up)]);
+                return Err(error);
+            }
+        }
+        Ok(format!(
+            "from={} ({},{}); {pointer_detail}; waypoints={}; to={} ({},{}); button={button:?}",
+            points[0].2,
+            points[0].0,
+            points[0].1,
+            points.len(),
+            points.last().expect("path is non-empty").2,
+            points.last().expect("path is non-empty").0,
+            points.last().expect("path is non-empty").1,
+        ))
+    }
+
+    fn send_pointer_action(
+        &self,
+        session: &ComputerSessionId,
+        action: &ComputerPointerAction,
+    ) -> Result<String, ComputerError> {
+        match action {
+            ComputerPointerAction::Click { at, button, clicks } => {
+                if *clicks == 0 || *clicks > 3 {
+                    return Err(ComputerError::InvalidAction(
+                        "modified pointer click count must be between 1 and 3".into(),
+                    ));
+                }
+                self.send_mouse_button(session, at, *button, u32::from(*clicks))
+            }
+            ComputerPointerAction::Move { to } => self.send_pointer_move(session, to),
+            ComputerPointerAction::Drag { path, button } => {
+                self.send_drag_path(session, path, *button)
+            }
+            ComputerPointerAction::Scroll {
+                at,
+                delta_x,
+                delta_y,
+            } => self.send_scroll_delta(session, at, *delta_x, *delta_y),
+        }
+    }
+
+    fn send_modified_pointer(
+        &self,
+        session: &ComputerSessionId,
+        action: &ComputerPointerAction,
+        modifiers: &[String],
+    ) -> Result<String, ComputerError> {
+        if modifiers.is_empty() {
+            return self.send_pointer_action(session, action);
+        }
+        let mut pressed = 0usize;
+        for modifier in modifiers {
+            if let Err(error) = self.send_key_transition(modifier, true) {
+                for previous in modifiers[..pressed].iter().rev() {
+                    let _ = self.send_key_transition(previous, false);
+                }
+                return Err(error);
+            }
+            pressed += 1;
+        }
+        let action_result = self.send_pointer_action(session, action);
+        let mut release_error = None;
+        for modifier in modifiers[..pressed].iter().rev() {
+            if let Err(error) = self.send_key_transition(modifier, false) {
+                release_error.get_or_insert(error);
+            }
+        }
+        action_result?;
+        if let Some(error) = release_error {
+            return Err(error);
+        }
+        Ok(format!("modifiers={modifiers:?}; transaction=true"))
+    }
+
     pub fn capture_primary_profile(
         &self,
         png_mode: NativePngMode,
@@ -1876,6 +2125,7 @@ impl WinNativeBackend {
                     desktop_origin: info.monitor.origin,
                     dpi: info.dpi,
                     scale: info.scale,
+                    pixel_to_desktop_scale: Some(DpiScale::ONE),
                     captured_at: Some(SystemTime::now()),
                 },
                 bytes,
@@ -1933,6 +2183,9 @@ impl WinNativeBackend {
             desktop_origin: display.physical_bounds.origin,
             dpi: display.dpi,
             scale: display.scale,
+            // The Windows backend is per-monitor DPI aware and GDI returns
+            // physical pixels in the same DesktopPhysical coordinate space.
+            pixel_to_desktop_scale: Some(DpiScale::ONE),
             width: gdi.width,
             height: gdi.height,
             pixel_format: FramePixelFormat::Bgra8,
@@ -2245,6 +2498,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
         ComputerAction::KeyDown { .. } => "key_down",
         ComputerAction::KeyUp { .. } => "key_up",
         ComputerAction::HoldKey { .. } => "hold_key",
+        ComputerAction::ModifiedPointer { .. } => "modified_pointer",
     }
 }
 
@@ -2347,7 +2601,7 @@ impl WinNativeBackend {
                 "pixel target window disappeared before click".into(),
             );
         };
-        if !window.active {
+        if !pixel_foreground_admitted(window.active, window_id, action) {
             return PixelAttemptResult::error(
                 ComputerExecutionOutcome::FocusDenied,
                 "pixel target window is not foreground; pointer action rejected".into(),
@@ -2365,6 +2619,50 @@ impl WinNativeBackend {
         let dispatch_detail = executed
             .backend_detail
             .unwrap_or_else(|| "backend dispatch completed without detail".into());
+        if matches!(action, ComputerAction::FocusWindow { .. }) {
+            let windows = match self.enumerate_window_records(display) {
+                Ok(windows) => windows,
+                Err(error) => {
+                    return PixelAttemptResult {
+                        outcome: ComputerExecutionOutcome::OutcomeUnknown,
+                        verification: ComputerExecutionVerification {
+                            kind: Some(ComputerExecutionVerificationKind::Focused),
+                            detail: Some(format!(
+                                "focus action was dispatched but foreground verification failed: {error}"
+                            )),
+                            ..Default::default()
+                        },
+                        generation_after: None,
+                        verification_ms: 0,
+                        detail: Some("focus action outcome could not be verified".into()),
+                    };
+                }
+            };
+            let focused = windows
+                .iter()
+                .any(|window| window.id == *window_id && window.active);
+            return PixelAttemptResult {
+                outcome: if focused {
+                    ComputerExecutionOutcome::Performed
+                } else {
+                    ComputerExecutionOutcome::VerificationFailed
+                },
+                verification: ComputerExecutionVerification {
+                    kind: Some(ComputerExecutionVerificationKind::Focused),
+                    verified: focused,
+                    focused: Some(focused),
+                    detail: Some(if focused {
+                        "target window is foreground after focus action".into()
+                    } else {
+                        "focus action was dispatched but target window is not foreground".into()
+                    }),
+                    ..Default::default()
+                },
+                generation_after: None,
+                verification_ms: 0,
+                detail: Some(dispatch_detail),
+            };
+        }
         if external_input_action_requires_fixture_evidence(action) {
             return PixelAttemptResult {
                 outcome: ComputerExecutionOutcome::Performed,
@@ -2657,6 +2955,35 @@ impl ComputerBackend for WinNativeBackend {
         Ok(self.topology()?.topology.clone())
     }
 
+    async fn observe(
+        &mut self,
+        session: &ComputerSessionId,
+    ) -> Result<alice_computer_use_core::ComputerObservation, ComputerError> {
+        self.refresh_topology()?;
+        let topology = self.topology()?.topology.clone();
+        let screens = topology.displays.clone();
+        let display = self.primary_display_info()?;
+        let windows = self.enumerate_window_records(&display)?;
+        let active_window = windows
+            .iter()
+            .find(|window| window.active)
+            .map(|window| window.id.clone());
+        let frame = topology
+            .primary_display_id
+            .clone()
+            .map(|display_id| self.capture_display_frame(session, &display_id))
+            .transpose()?;
+        Ok(alice_computer_use_core::ComputerObservation {
+            session_id: session.clone(),
+            screens,
+            windows,
+            active_window,
+            screenshot: None,
+            frame,
+            display_topology: Some(topology),
+        })
+    }
+
     async fn enumerate_windows(
         &mut self,
         _session: &ComputerSessionId,
@@ -2821,11 +3148,23 @@ impl ComputerBackend for WinNativeBackend {
             }
             ComputerAction::KeyPress { key, target } => {
                 self.foreground_target(target.as_ref())?;
-                (self.send_key(key)?, "key_press")
+                let detail = self.send_key(key)?;
+                let detail = if is_windows_key_name(key) {
+                    format!("{detail}; {}", self.shell_transition_probe())
+                } else {
+                    detail
+                };
+                (detail, "key_press")
             }
             ComputerAction::Hotkey { keys, target } => {
                 self.foreground_target(target.as_ref())?;
-                (self.send_hotkey(keys)?, "hotkey")
+                let detail = self.send_hotkey(keys)?;
+                let detail = if keys.iter().any(|key| is_windows_key_name(key)) {
+                    format!("{detail}; {}", self.shell_transition_probe())
+                } else {
+                    detail
+                };
+                (detail, "hotkey")
             }
             ComputerAction::MouseDown { button, at, target } => {
                 self.foreground_target(target.as_ref())?;
@@ -2917,6 +3256,10 @@ impl ComputerBackend for WinNativeBackend {
                     }
                 }
             }
+            ComputerAction::ModifiedPointer { action, modifiers } => (
+                self.send_modified_pointer(session, action, modifiers)?,
+                "modified_pointer",
+            ),
         };
         Ok(ComputerActionResult {
             status: ActionStatus::Performed,
@@ -3340,6 +3683,7 @@ impl ComputerBackend for WinNativeBackend {
             ComputerExecutionIntent::Pixel {
                 action,
                 target_window_id,
+                ..
             } => {
                 if request.strategy == ComputerExecutionStrategy::SemanticOnly {
                     final_outcome = ComputerExecutionOutcome::InvalidRequest;
@@ -3684,6 +4028,38 @@ fn window_class_name(hwnd: HWND) -> Option<String> {
     (length > 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
 }
 
+// Focus is the only action allowed to establish foreground ownership. It must
+// refer to the same window that passed target admission.
+fn pixel_foreground_admitted(active: bool, window_id: &WindowId, action: &ComputerAction) -> bool {
+    match action {
+        ComputerAction::FocusWindow {
+            window_id: focus_target,
+        } => focus_target == window_id,
+        _ => active,
+    }
+}
+
+fn is_windows_key_name(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "win" | "windows" | "meta" | "cmd" | "command"
+    )
+}
+
+fn native_shell_surface(class_name: &str) -> Option<&'static str> {
+    match class_name.trim().to_ascii_lowercase().as_str() {
+        "shell_traywnd" | "shell_secondarytraywnd" => Some("taskbar"),
+        "progman" | "workerw" => Some("desktop"),
+        "windows.ui.core.corewindow"
+        | "applicationframewindow"
+        | "xamlexplorerhostislandwindow"
+        | "xaml_windowedpopup"
+        | "xaml_windowedpopupclass"
+        | "windows.ui.input.inkingwindowclass" => Some("start_or_shell_menu"),
+        _ => None,
+    }
+}
+
 fn process_image_path(process_id: u32) -> Option<String> {
     let process =
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
@@ -3732,7 +4108,15 @@ fn millis_from_micros(value: u128) -> u128 {
 fn external_input_action_requires_fixture_evidence(action: &ComputerAction) -> bool {
     matches!(
         action,
-        ComputerAction::MouseDown { .. }
+        // Keyboard/text dispatch has no reliable, backend-independent state
+        // readback. Treat a successful SendInput transaction as performed and
+        // leave application-level verification to the caller. Without these
+        // variants a hotkey or text action was sent successfully but then
+        // downgraded to `verification_failed` because no UIA state changed.
+        ComputerAction::TypeText { .. }
+            | ComputerAction::KeyPress { .. }
+            | ComputerAction::Hotkey { .. }
+            | ComputerAction::MouseDown { .. }
             | ComputerAction::MouseUp { .. }
             | ComputerAction::MiddleClick { .. }
             | ComputerAction::TripleClick { .. }
@@ -4199,6 +4583,7 @@ mod frame_store_tests {
                 stride: 4,
                 dpi: DpiScale::ONE,
                 scale: DpiScale::ONE,
+                pixel_to_desktop_scale: Some(DpiScale::ONE),
                 captured_at: None,
                 content_revision: generation,
                 stale_topology: false,
@@ -4359,6 +4744,73 @@ mod frame_store_tests {
         assert!(backend.capability_cache.contains_key(&session));
         backend.close_session(&session).await.unwrap();
         assert!(!backend.capability_cache.contains_key(&session));
+    }
+
+    #[test]
+    fn focus_can_establish_foreground_only_for_the_admitted_target() {
+        let target = WindowId::new("target");
+        let focus = ComputerAction::FocusWindow {
+            window_id: target.clone(),
+        };
+        assert!(pixel_foreground_admitted(false, &target, &focus));
+        assert!(!pixel_foreground_admitted(
+            false,
+            &WindowId::new("other"),
+            &focus
+        ));
+        assert!(!pixel_foreground_admitted(
+            true,
+            &WindowId::new("other"),
+            &focus
+        ));
+        let key = ComputerAction::KeyPress {
+            key: "Enter".into(),
+            target: Some(target.clone()),
+        };
+        assert!(!pixel_foreground_admitted(false, &target, &key));
+        assert!(pixel_foreground_admitted(true, &target, &key));
+    }
+
+    #[test]
+    fn keyboard_and_text_dispatch_use_external_fixture_verification() {
+        let target = Some(WindowId::new("target"));
+        assert!(external_input_action_requires_fixture_evidence(
+            &ComputerAction::TypeText {
+                text: "hello".into(),
+                target: target.clone(),
+                at: None,
+            }
+        ));
+        assert!(external_input_action_requires_fixture_evidence(
+            &ComputerAction::KeyPress {
+                key: "Enter".into(),
+                target: target.clone(),
+            }
+        ));
+        assert!(external_input_action_requires_fixture_evidence(
+            &ComputerAction::Hotkey {
+                keys: vec!["ctrl".into(), "l".into()],
+                target,
+            }
+        ));
+    }
+
+    #[test]
+    fn shell_surface_and_windows_key_detection_are_bounded() {
+        assert!(is_windows_key_name("WIN"));
+        assert!(is_windows_key_name("Meta"));
+        assert!(!is_windows_key_name("ALT"));
+        assert_eq!(native_shell_surface("Shell_TrayWnd"), Some("taskbar"));
+        assert_eq!(native_shell_surface("WorkerW"), Some("desktop"));
+        assert_eq!(
+            native_shell_surface("Windows.UI.Core.CoreWindow"),
+            Some("start_or_shell_menu")
+        );
+        assert_eq!(
+            native_shell_surface("Xaml_WindowedPopupClass"),
+            Some("start_or_shell_menu")
+        );
+        assert_eq!(native_shell_surface("Chrome_WidgetWin_1"), None);
     }
 }
 

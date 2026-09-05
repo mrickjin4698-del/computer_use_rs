@@ -110,6 +110,32 @@ pub struct BrokerExecutionRequest {
     pub execution: ComputerExecutionRequest,
 }
 
+/// Read-only admission data captured once for a bounded action batch. The
+/// final target-identity and interaction checks still run for every dispatch;
+/// foreground matching remains mandatory for takeover routes, while macOS
+/// background routes validate the target process/window.
+#[derive(Clone, Debug)]
+pub struct BrokerExecutionBatchContext {
+    session: BrokerSessionRef,
+    lease: DesktopLeaseRef,
+    windows: Vec<Window>,
+    target: Option<WindowId>,
+    target_window: Option<Window>,
+    capability_profile: Option<ApplicationCapabilityProfile>,
+}
+
+impl BrokerExecutionBatchContext {
+    pub fn target_window_id(&self) -> Option<WindowId> {
+        self.target.clone()
+    }
+
+    pub fn target_application(&self) -> Option<ApplicationIdentity> {
+        self.capability_profile
+            .as_ref()
+            .map(|profile| profile.application.clone())
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct DesktopLeaseRef {
     pub lease_id: String,
@@ -497,6 +523,10 @@ struct ComputerInteractionLease {
     session_id: ComputerSessionId,
     owner: ComputerRequestOwner,
     target: Option<WindowId>,
+    /// Keyboard/text input can remain bound to the same process while its
+    /// top-level window changes (for example after a browser opens a tab).
+    /// Pointer input continues to use the exact `target` window below.
+    target_application: Option<ApplicationIdentity>,
     action: InteractionActionClass,
     created_at: Instant,
     baseline: InputActivitySnapshot,
@@ -508,7 +538,8 @@ struct ComputerInteractionLease {
 ///
 /// It deliberately does not infer takeover from the system idle timer. A
 /// low-level monitor attributes hardware and injected activity, while every
-/// side-effect dispatch still requires a fresh foreground check.
+/// side-effect dispatch still requires a fresh target/interaction check;
+/// takeover routes additionally require a fresh foreground check.
 pub struct ComputerInteractionGuard {
     state: Mutex<InteractionGuardState>,
     monitor: Arc<InputActivityMonitor>,
@@ -594,6 +625,7 @@ impl ComputerInteractionGuard {
             session_id: session.computer_session_id.clone(),
             owner: session.owner.clone(),
             target,
+            target_application: None,
             action,
             created_at: Instant::now(),
             last_alice_input_sequence: baseline.alice_injected_sequence,
@@ -608,6 +640,7 @@ impl ComputerInteractionGuard {
         windows: &[Window],
         target: Option<&WindowId>,
         focus_window_action: bool,
+        allow_background: bool,
     ) -> Result<Option<WindowId>, BrokerError> {
         let actual = foreground_window(windows);
         if actual.is_none() {
@@ -617,7 +650,22 @@ impl ComputerInteractionGuard {
             ));
         }
         let expected_target = target.or(lease.target.as_ref());
-        if !focus_window_action && expected_target.is_some() && actual.as_ref() != expected_target {
+        let application_matches = lease
+            .target_application
+            .as_ref()
+            .is_some_and(|application| {
+                application.process_id.is_some_and(|process_id| {
+                    windows.iter().any(|window| {
+                        (allow_background || window.active) && window.process_id == Some(process_id)
+                    })
+                })
+            });
+        if !allow_background
+            && !focus_window_action
+            && !application_matches
+            && expected_target.is_some()
+            && actual.as_ref() != expected_target
+        {
             self.set_state(InteractionState::ContextChanged);
             return Err(BrokerError::TargetForegroundChanged {
                 target: expected_target.cloned(),
@@ -833,6 +881,39 @@ fn same_target_identity(
     // replayed against the old geometry.
     matches!(&request.intent, ComputerExecutionIntent::Semantic(_))
         || expected.bounds == actual.bounds
+}
+
+fn same_batch_target_identity(
+    expected: &Window,
+    actual: &Window,
+    request: &ComputerExecutionRequest,
+) -> bool {
+    if expected.id != actual.id
+        || expected.process_id != actual.process_id
+        || expected.security != actual.security
+    {
+        return false;
+    }
+    let geometry_bound = matches!(
+        &request.intent,
+        ComputerExecutionIntent::Pixel {
+            action: ComputerAction::Click { .. }
+                | ComputerAction::DoubleClick { .. }
+                | ComputerAction::RightClick { .. }
+                | ComputerAction::MovePointer { .. }
+                | ComputerAction::Drag { .. }
+                | ComputerAction::Scroll { .. }
+                | ComputerAction::MouseDown { .. }
+                | ComputerAction::MouseUp { .. }
+                | ComputerAction::MiddleClick { .. }
+                | ComputerAction::TripleClick { .. }
+                | ComputerAction::ModifierClick { .. }
+                | ComputerAction::ModifiedPointer { .. }
+                | ComputerAction::TypeText { at: Some(_), .. },
+            ..
+        }
+    );
+    !geometry_bound || expected.bounds == actual.bounds
 }
 
 #[derive(Clone)]
@@ -1127,6 +1208,114 @@ impl ComputerExecutionBroker {
 
     pub fn window_list(&self, reference: &BrokerSessionRef) -> Result<Vec<Window>, BrokerError> {
         self.with_session(reference, |session| session.window_list())
+    }
+
+    /// Prepare one bounded batch from a fresh broker-owned window snapshot.
+    /// The snapshot is never the only final admission decision: each action
+    /// still performs a final window-list/preflight immediately before
+    /// dispatch, and the target identity is revalidated against this snapshot.
+    pub fn prepare_execution_batch(
+        &self,
+        reference: &BrokerSessionRef,
+        lease: &DesktopLeaseRef,
+        requested_target: Option<WindowId>,
+        probe_capability: bool,
+        allow_background: bool,
+    ) -> Result<BrokerExecutionBatchContext, BrokerError> {
+        self.refresh_state();
+        let session = {
+            let state = self.state.read().expect("computer broker poisoned");
+            let session = self.validate_locked(&state, reference)?.session.clone();
+            self.validate_lease_locked(&state, reference, lease)?;
+            session
+        };
+        let windows = session.window_list().map_err(BrokerError::from)?;
+        let active = foreground_window(&windows);
+        let target = match requested_target {
+            Some(target) => {
+                let target_window = windows.iter().find(|window| window.id == target);
+                let Some(target_window) = target_window else {
+                    return Err(BrokerError::InvalidRequest(
+                        "target window is not present in the fresh window list".into(),
+                    ));
+                };
+                if !allow_background && !target_window.active {
+                    return Err(BrokerError::TargetForegroundChanged {
+                        target: Some(target),
+                        actual: active,
+                    });
+                }
+                Some(target_window.id.clone())
+            }
+            None => active,
+        };
+        let target_window = target
+            .as_ref()
+            .and_then(|target| windows.iter().find(|window| &window.id == target))
+            .cloned();
+        let capability_profile = if probe_capability {
+            target_window
+                .as_ref()
+                .map(|window| session.capability_probe(&window.id))
+                .transpose()
+                .map_err(BrokerError::from)?
+        } else {
+            None
+        };
+        Ok(BrokerExecutionBatchContext {
+            session: reference.clone(),
+            lease: lease.clone(),
+            windows,
+            target,
+            target_window,
+            capability_profile,
+        })
+    }
+
+    /// Dispatch one request using a previously prepared bounded-batch
+    /// context. The request and lease must belong to that exact context.
+    pub fn execute_with_profile_in_batch(
+        &self,
+        request: BrokerExecutionRequest,
+        profile: ComputerApprovalProfile,
+        context: &BrokerExecutionBatchContext,
+    ) -> Result<ComputerExecutionResult, BrokerError> {
+        if request.session != context.session || request.lease != context.lease {
+            return Err(BrokerError::InvalidRequest(
+                "execution request does not belong to the prepared batch context".into(),
+            ));
+        }
+        let requested_target = request_target_window(&request.execution)
+            .or_else(|| requested_interaction_target(&request.execution));
+        let application_matches = request
+            .execution
+            .target_application()
+            .and_then(|application| application.process_id)
+            .zip(
+                context
+                    .target_window
+                    .as_ref()
+                    .and_then(|window| window.process_id),
+            )
+            .is_some_and(|(expected, actual)| expected == actual);
+        if request.execution.target_application().is_some() {
+            if !application_matches {
+                return Err(BrokerError::InvalidRequest(
+                    "application target does not match the prepared foreground application".into(),
+                ));
+            }
+        } else if requested_target.as_ref() != context.target.as_ref() && requested_target.is_some()
+        {
+            return Err(BrokerError::InvalidRequest(
+                "execution target does not match the prepared batch context".into(),
+            ));
+        }
+        let mut policy = self.policy();
+        policy.set_profile(profile);
+        let forced_target = (!is_unscoped_keyboard_input(&request.execution))
+            .then(|| context.target.clone())
+            .flatten();
+        self.execute_with_policy_bound(request, &policy, forced_target, Some(context))
     }
 
     pub fn observe(
@@ -1430,7 +1619,8 @@ impl ComputerExecutionBroker {
         let mut policy = self.policy();
         policy.set_profile(profile);
         policy.record_approval(request.request_id.clone());
-        let result = self.execute_with_policy_bound(request, &policy, Some(target.id.clone()));
+        let result =
+            self.execute_with_policy_bound(request, &policy, Some(target.id.clone()), None);
         match &result {
             Ok(_) => self.emit_approval_event(
                 ComputerEventKind::ApprovalResumeCompleted,
@@ -1491,7 +1681,7 @@ impl ComputerExecutionBroker {
         request: BrokerExecutionRequest,
         policy: &ComputerPolicy,
     ) -> Result<ComputerExecutionResult, BrokerError> {
-        self.execute_with_policy_bound(request, policy, None)
+        self.execute_with_policy_bound(request, policy, None, None)
     }
 
     fn execute_with_policy_bound(
@@ -1499,6 +1689,7 @@ impl ComputerExecutionBroker {
         request: BrokerExecutionRequest,
         policy: &ComputerPolicy,
         forced_target: Option<WindowId>,
+        batch_context: Option<&BrokerExecutionBatchContext>,
     ) -> Result<ComputerExecutionResult, BrokerError> {
         request.validate()?;
         let action_kind = telemetry::action_kind(&request.execution);
@@ -1554,11 +1745,18 @@ impl ComputerExecutionBroker {
                 return Err(error);
             }
         };
-        let windows = session.window_list().map_err(BrokerError::from)?;
+        interaction_lease.target_application = request.execution.target_application().cloned();
+        let windows = match batch_context {
+            Some(context) => context.windows.clone(),
+            None => session.window_list().map_err(BrokerError::from)?,
+        };
         let mut target = request_target_window(&request.execution)
             .or_else(|| requested_interaction_target(&request.execution))
             .or(forced_target);
-        if target.is_none() && !is_focus_window(&request.execution) {
+        if target.is_none()
+            && !is_focus_window(&request.execution)
+            && !is_unscoped_keyboard_input(&request.execution)
+        {
             // Pointer/keyboard actions without an explicit target still act
             // on the observed foreground window. Binding that fresh window
             // into admission prevents a protected active surface from being
@@ -1571,33 +1769,66 @@ impl ComputerExecutionBroker {
         if interaction_lease.target.is_none() {
             interaction_lease.target = target.clone();
         }
-        let target_window = target
-            .as_ref()
-            .map(|target| {
-                windows
-                    .iter()
-                    .find(|window| &window.id == target)
-                    .ok_or_else(|| {
-                        BrokerError::InvalidRequest(
-                            "target window is not present in the fresh window list".into(),
-                        )
-                    })
-            })
-            .transpose()?;
+        let target_window = if let Some(context) = batch_context {
+            context.target_window.as_ref()
+        } else {
+            target
+                .as_ref()
+                .map(|target| {
+                    windows
+                        .iter()
+                        .find(|window| &window.id == target)
+                        .ok_or_else(|| {
+                            BrokerError::InvalidRequest(
+                                "target window is not present in the fresh window list".into(),
+                            )
+                        })
+                })
+                .transpose()?
+        };
+        if let Some(application) = request.execution.target_application() {
+            let matches = target_window.is_some_and(|window| {
+                application
+                    .process_id
+                    .is_some_and(|process_id| window.process_id == Some(process_id))
+            });
+            if !matches {
+                return Err(BrokerError::InvalidRequest(
+                    "application target does not match the current window context".into(),
+                ));
+            }
+        }
         let mut capability_profile = None;
-        if let Some(target_window) = target_window.as_ref() {
-            let profile = self
-                .capability_probe(&request.session, &target_window.id)
-                .inspect_err(|error| {
-                    self.emit_event(self.event_for_error(
-                        ComputerEventKind::ActionBlocked,
-                        &request,
-                        Some(error.to_string()),
-                        Some(action_kind.clone()),
-                    ));
-                })?;
-            admit_pixel_capability(&request.execution, &profile)?;
-            capability_profile = Some(profile);
+        // Semantic actions already carry a generation-scoped AX element. A
+        // capability probe here is both unnecessary (pixel admission only)
+        // and harmful on macOS because AX probing can refresh the semantic
+        // snapshot and invalidate that element before dispatch.
+        if matches!(
+            &request.execution.intent,
+            ComputerExecutionIntent::Pixel { .. }
+        ) && !is_unscoped_keyboard_input(&request.execution)
+        {
+            if let Some(target_window) = target_window.as_ref() {
+                let profile = if let Some(context) = batch_context {
+                    context.capability_profile.clone().ok_or_else(|| {
+                        BrokerError::InvalidRequest(
+                            "prepared batch context is missing target capability data".into(),
+                        )
+                    })?
+                } else {
+                    self.capability_probe(&request.session, &target_window.id)
+                        .inspect_err(|error| {
+                            self.emit_event(self.event_for_error(
+                                ComputerEventKind::ActionBlocked,
+                                &request,
+                                Some(error.to_string()),
+                                Some(action_kind.clone()),
+                            ));
+                        })?
+                };
+                admit_pixel_capability(&request.execution, &profile)?;
+                capability_profile = Some(profile);
+            }
         }
         let admission = policy.admit(
             &request.request_id,
@@ -1642,6 +1873,7 @@ impl ComputerExecutionBroker {
             &windows,
             target.as_ref(),
             is_focus_window(&request.execution),
+            background_route_allowed(&request.execution),
         ) {
             self.cleanup_after_interaction_conflict(
                 &session,
@@ -1658,43 +1890,6 @@ impl ComputerExecutionBroker {
             return Err(error);
         }
 
-        // Re-read the foreground immediately before dispatch.  The initial
-        // observation may have become stale while policy/capability checks
-        // were running, and a stale foreground must never receive input.
-        let dispatch_windows = match session.window_list() {
-            Ok(windows) => windows,
-            Err(error) => {
-                let error = BrokerError::from(error);
-                self.emit_event(self.event_for_error(
-                    ComputerEventKind::ActionBlocked,
-                    &request,
-                    Some(error.to_string()),
-                    Some(action_kind.clone()),
-                ));
-                self.audit_error(&request, &action_kind, started.elapsed(), &error);
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.interaction.preflight(
-            &interaction_lease,
-            &dispatch_windows,
-            target.as_ref(),
-            is_focus_window(&request.execution),
-        ) {
-            self.cleanup_after_interaction_conflict(
-                &session,
-                &request.session.computer_session_id,
-                &error,
-            );
-            self.emit_event(self.event_for_error(
-                ComputerEventKind::ActionBlocked,
-                &request,
-                Some(error.to_string()),
-                Some(action_kind.clone()),
-            ));
-            self.audit_error(&request, &action_kind, started.elapsed(), &error);
-            return Err(error);
-        }
         let dispatch_key = (
             request.session.computer_session_id.clone(),
             request.request_id.clone(),
@@ -1731,11 +1926,63 @@ impl ComputerExecutionBroker {
                 return Err(error);
             }
         };
+        if let Some(context) = batch_context {
+            if let Some(expected) = context.target_window.as_ref() {
+                // A global keyboard action deliberately follows the current
+                // foreground surface. Transient menus/popovers may disappear
+                // while the event is in flight, so the batch's initial window
+                // identity must not be treated as a stale target for this
+                // unscoped path. Foreground and interaction checks still run.
+                if !is_unscoped_keyboard_input(&request.execution) {
+                    let identity_ok =
+                        if let Some(application) = request.execution.target_application() {
+                            final_windows.iter().any(|window| {
+                                (background_route_allowed(&request.execution) || window.active)
+                                    && application.process_id.is_some_and(|process_id| {
+                                        window.process_id == Some(process_id)
+                                    })
+                            })
+                        } else {
+                            final_windows
+                                .iter()
+                                .find(|window| window.id == expected.id)
+                                .is_some_and(|actual| {
+                                    same_batch_target_identity(expected, actual, &request.execution)
+                                })
+                        };
+                    if !identity_ok {
+                        let error = BrokerError::InvalidRequest(
+                            "target window identity or bounds changed during the prepared batch"
+                                .into(),
+                        );
+                        self.state
+                            .write()
+                            .expect("computer broker poisoned")
+                            .dispatched
+                            .remove(&dispatch_key);
+                        self.cleanup_after_interaction_conflict(
+                            &session,
+                            &request.session.computer_session_id,
+                            &error,
+                        );
+                        self.emit_event(self.event_for_error(
+                            ComputerEventKind::ActionBlocked,
+                            &request,
+                            Some(error.to_string()),
+                            Some(action_kind.clone()),
+                        ));
+                        self.audit_error(&request, &action_kind, started.elapsed(), &error);
+                        return Err(error);
+                    }
+                }
+            }
+        }
         if let Err(error) = self.interaction.preflight(
             &interaction_lease,
             &final_windows,
             target.as_ref(),
             is_focus_window(&request.execution),
+            background_route_allowed(&request.execution),
         ) {
             self.state
                 .write()
@@ -2258,7 +2505,9 @@ fn request_target_window(request: &ComputerExecutionRequest) -> Option<WindowId>
         ComputerExecutionIntent::Pixel {
             action,
             target_window_id,
+            target_application,
         } => target_window_id.clone().or_else(|| match action {
+            _ if target_application.is_some() => None,
             ComputerAction::TypeText { target, .. }
             | ComputerAction::KeyPress { target, .. }
             | ComputerAction::Hotkey { target, .. }
@@ -2276,7 +2525,8 @@ fn request_target_window(request: &ComputerExecutionRequest) -> Option<WindowId>
             | ComputerAction::MovePointer { .. }
             | ComputerAction::Drag { .. }
             | ComputerAction::Scroll { .. }
-            | ComputerAction::FocusWindow { .. } => None,
+            | ComputerAction::FocusWindow { .. }
+            | ComputerAction::ModifiedPointer { .. } => None,
         }),
         ComputerExecutionIntent::Semantic(_) => None,
     }
@@ -2290,6 +2540,52 @@ fn requested_interaction_target(request: &ComputerExecutionRequest) -> Option<Wi
         } => Some(window_id.clone()),
         _ => None,
     })
+}
+
+fn is_global_desktop_shortcut(request: &ComputerExecutionRequest) -> bool {
+    let ComputerExecutionIntent::Pixel {
+        action: ComputerAction::Hotkey {
+            keys, target: None, ..
+        },
+        target_window_id: None,
+        target_application: None,
+    } = &request.intent
+    else {
+        return false;
+    };
+    let has = |names: &[&str]| keys.iter().any(|key| names.contains(&key.as_str()));
+    (has(&["meta", "cmd", "command"]) && has(&["tab", "space", "w", "q"]))
+        || (has(&["alt", "option"]) && has(&["tab"]))
+}
+
+fn is_unscoped_keyboard_input(request: &ComputerExecutionRequest) -> bool {
+    if is_global_desktop_shortcut(request) {
+        return true;
+    }
+    let ComputerExecutionIntent::Pixel {
+        action,
+        target_window_id: None,
+        target_application: None,
+    } = &request.intent
+    else {
+        return false;
+    };
+    matches!(
+        action,
+        ComputerAction::TypeText { target: None, .. }
+            | ComputerAction::KeyPress { target: None, .. }
+            | ComputerAction::Hotkey { target: None, .. }
+            | ComputerAction::KeyDown { target: None, .. }
+            | ComputerAction::KeyUp { target: None, .. }
+            | ComputerAction::HoldKey { target: None, .. }
+    )
+}
+
+/// Background admission is currently a macOS-native capability. Keeping this
+/// gate in the broker prevents the portable default from weakening Windows'
+/// foreground contract before a Windows background provider is implemented.
+fn background_route_allowed(request: &ComputerExecutionRequest) -> bool {
+    cfg!(target_os = "macos") && request.allows_background()
 }
 
 fn interaction_action_class(request: &ComputerExecutionRequest) -> InteractionActionClass {
@@ -2315,6 +2611,16 @@ fn interaction_action_class(request: &ComputerExecutionRequest) -> InteractionAc
             ComputerAction::MouseDown { .. } => InteractionActionClass::HeldPointerDown,
             ComputerAction::MouseUp { .. } => InteractionActionClass::HeldPointerUp,
             ComputerAction::FocusWindow { .. } => InteractionActionClass::FocusWindow,
+            ComputerAction::ModifiedPointer { action, .. } => match action {
+                alice_computer_use_core::ComputerPointerAction::Click { .. } => {
+                    InteractionActionClass::Click
+                }
+                alice_computer_use_core::ComputerPointerAction::Move { .. }
+                | alice_computer_use_core::ComputerPointerAction::Drag { .. }
+                | alice_computer_use_core::ComputerPointerAction::Scroll { .. } => {
+                    InteractionActionClass::PointerGesture
+                }
+            },
         },
     }
 }
@@ -2389,8 +2695,8 @@ mod tests {
     };
     use crate::input_activity::{InputActivityMonitor, InputEventKind, InputSource};
     use alice_computer_use_core::{
-        ComputerAction, ComputerExecutionRequest, Coordinate, CoordinateSpace, DpiScale, ElementId,
-        Point, SemanticAction, Size, Window, WindowId,
+        ApplicationIdentity, ComputerAction, ComputerExecutionRequest, Coordinate, CoordinateSpace,
+        DpiScale, ElementId, Point, ProcessArchitecture, SemanticAction, Size, Window, WindowId,
     };
     use std::sync::Arc;
 
@@ -2398,6 +2704,54 @@ mod tests {
     fn spatial_text_holds_pointer_ownership_for_the_atomic_action() {
         assert!(InteractionActionClass::SpatialTypeText.blocks_hardware_mouse_move());
         assert!(!InteractionActionClass::TypeText.blocks_hardware_mouse_move());
+    }
+
+    #[test]
+    fn application_scoped_keyboard_survives_a_top_level_window_change() {
+        let monitor = Arc::new(InputActivityMonitor::for_test(true));
+        let guard = ComputerInteractionGuard::new(monitor);
+        let session = session();
+        let mut lease = guard
+            .begin_lease(
+                &desktop_lease(&session),
+                &session,
+                InteractionActionClass::TypeText,
+                Some(WindowId::new("old-window")),
+            )
+            .unwrap();
+        lease.target_application = Some(ApplicationIdentity {
+            process_id: Some(42),
+            executable_name: Some("Browser".into()),
+            executable_path: None,
+            executable_hash: None,
+            process_architecture: ProcessArchitecture::Unknown,
+            top_level_window_class: None,
+            framework_hints: Vec::new(),
+            version: None,
+        });
+        let mut active = window("new-tab", true);
+        active.process_id = Some(42);
+        assert!(guard
+            .preflight(
+                &lease,
+                &[active],
+                Some(&WindowId::new("old-window")),
+                false,
+                true,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn global_desktop_shortcut_is_not_bound_to_a_window() {
+        let request = ComputerExecutionRequest::pixel(
+            ComputerAction::Hotkey {
+                keys: vec!["meta".into(), "space".into()],
+                target: None,
+            },
+            None,
+        );
+        assert!(super::is_global_desktop_shortcut(&request));
     }
 
     fn session() -> BrokerSessionRef {
@@ -2422,6 +2776,7 @@ mod tests {
         Window {
             id: WindowId::new(id),
             title: id.to_owned(),
+            class_name: None,
             process_id: None,
             bounds: Coordinate {
                 space: CoordinateSpace::DesktopPhysical,
@@ -2442,7 +2797,7 @@ mod tests {
 
     #[test]
     fn observation_establishes_agent_input_baseline() {
-        let guard = ComputerInteractionGuard::default();
+        let guard = ComputerInteractionGuard::new(Arc::new(InputActivityMonitor::for_test(true)));
         guard.observe();
         assert_eq!(guard.state(), InteractionState::NoConflict);
     }
@@ -2600,7 +2955,13 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            guard.preflight(&lease, &[window("other", true)], Some(&target), false),
+            guard.preflight(
+                &lease,
+                &[window("other", true)],
+                Some(&target),
+                false,
+                false
+            ),
             Err(BrokerError::TargetForegroundChanged { .. })
         ));
         assert_eq!(guard.state(), InteractionState::ContextChanged);

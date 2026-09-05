@@ -561,6 +561,7 @@ fn gate1_tools(tools: &Value) -> HarnessResult<()> {
     let expected = [
         "computer_observe",
         "computer_execute",
+        "computer_use",
         "computer_screenshot",
         "computer_validate",
         "computer_health",

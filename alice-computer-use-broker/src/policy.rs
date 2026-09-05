@@ -227,7 +227,8 @@ pub(crate) fn risk_for(request: &ComputerExecutionRequest) -> ComputerRiskLevel 
             | ComputerAction::MovePointer { .. }
             | ComputerAction::Drag { .. }
             | ComputerAction::Scroll { .. }
-            | ComputerAction::FocusWindow { .. } => ComputerRiskLevel::BenignInteraction,
+            | ComputerAction::FocusWindow { .. }
+            | ComputerAction::ModifiedPointer { .. } => ComputerRiskLevel::BenignInteraction,
             ComputerAction::TypeText { .. }
             | ComputerAction::KeyPress { .. }
             | ComputerAction::Hotkey { .. }
@@ -308,6 +309,7 @@ mod tests {
         let mut window = Window {
             id: WindowId::new("host-window"),
             title: "Alice".into(),
+            class_name: None,
             process_id: Some(std::process::id()),
             bounds: Coordinate {
                 space: CoordinateSpace::DesktopPhysical,

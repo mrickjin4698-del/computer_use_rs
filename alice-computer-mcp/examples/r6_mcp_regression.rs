@@ -115,13 +115,14 @@ fn main() -> GateResult<()> {
         "computer_health",
         "computer_observe",
         "computer_execute",
+        "computer_use",
         "computer_screenshot",
         "computer_validate",
     ];
     if names != expected {
-        return Err(format!("five-tool MCP surface changed: {names:?}").into());
+        return Err(format!("MCP tool surface changed: {names:?}").into());
     }
-    println!("gate7.tools=PASS count=5 names={names:?}");
+    println!("gate7.tools=PASS count=6 names={names:?}");
 
     let health = mcp.tool("computer_health", json!({}))?;
     if health["isError"] == true || health["structuredContent"]["ready"] != true {

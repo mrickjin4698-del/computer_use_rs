@@ -278,6 +278,7 @@ pub fn action_kind(request: &ComputerExecutionRequest) -> String {
             ComputerAction::KeyPress { .. } => "pixel.key_press",
             ComputerAction::Hotkey { .. } => "pixel.hotkey",
             ComputerAction::FocusWindow { .. } => "pixel.focus_window",
+            ComputerAction::ModifiedPointer { .. } => "pixel.modified_pointer",
             _ => "pixel.input",
         }
         .to_owned(),

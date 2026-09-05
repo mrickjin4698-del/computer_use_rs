@@ -6,6 +6,9 @@ license = "Apache-2.0"
 description = "Local MCP server for Alice Computer Use"
 publish = false
 
+[features]
+interactive-e2e = []
+
 [[bin]]
 name = "alice-computer-mcp"
 path = "src/main.rs"
@@ -13,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 alice-computer-use-core = { path = "../alice-computer-use-core" }
 alice-computer-use-broker = { path = "../alice-computer-use-broker" }
+alice-computer-use-runtime = { path = "../alice-computer-use-runtime" }
 alice-computer-use-sidecar-client = { path = "../alice-computer-use-sidecar-client" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
@@ -24,3 +28,28 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+
+[[example]]
+name = "r4_mcp_e2e"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r4_mismatch_sidecar"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r5_mcp_e2e"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r6_mcp_regression"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r7_mcp_regression"
+test = false
+required-features = ["interactive-e2e"]

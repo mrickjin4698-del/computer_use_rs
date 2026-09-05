@@ -146,6 +146,7 @@ struct ClientInner {
     writer: Mutex<std::process::ChildStdin>,
     pending: Mutex<HashMap<String, PendingResponse>>,
     state: Mutex<ClientState>,
+    hello: Mutex<Option<HelloResult>>,
     state_changed: Condvar,
     next_request_id: AtomicU64,
     default_timeout: Duration,
@@ -199,6 +200,7 @@ impl ComputerSidecarClient {
                 process_id,
                 sessions: HashSet::new(),
             }),
+            hello: Mutex::new(None),
             state_changed: Condvar::new(),
             next_request_id: AtomicU64::new(1),
             default_timeout: timeout,
@@ -255,7 +257,22 @@ impl ComputerSidecarClient {
     }
 
     pub fn hello(&self) -> Result<HelloResult, SidecarError> {
-        self.call_typed("hello", serde_json::json!({}), false)
+        if let Some(hello) = self
+            .inner
+            .hello
+            .lock()
+            .expect("sidecar hello cache poisoned")
+            .clone()
+        {
+            return Ok(hello);
+        }
+        let hello: HelloResult = self.call_typed("hello", serde_json::json!({}), false)?;
+        *self
+            .inner
+            .hello
+            .lock()
+            .expect("sidecar hello cache poisoned") = Some(hello.clone());
+        Ok(hello)
     }
 
     pub fn health(&self) -> Result<HealthResult, SidecarError> {

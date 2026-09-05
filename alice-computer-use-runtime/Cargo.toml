@@ -3,14 +3,18 @@ name = "alice-computer-use-runtime"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Windows observation and action runtime for Alice Computer Use"
+description = "Cross-platform desktop observation and pixel action runtime for Alice Computer Use"
 publish = false
+
+[features]
+interactive-e2e = []
 
 [dependencies]
 alice-computer-use-core = { path = "../alice-computer-use-core" }
 async-trait = "0.1"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
@@ -33,3 +37,43 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[[example]]
+name = "r0_input_fixture"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r0_native_observation"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r5_action_fixture"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r5_toggle_independent_uia"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r6_display_gates"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r7_capture_gates"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r8_integrity_fixture"
+test = false
+required-features = ["interactive-e2e"]
+
+[[example]]
+name = "r9_pixel_only_fixture"
+test = false
+required-features = ["interactive-e2e"]

@@ -17,8 +17,16 @@ use std::{
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const CAPABILITY_CONTRACT_VERSION: u32 = 1;
+// Bumped for the explicit screenshot-pixel -> DesktopPhysical scale field.
+// A client must not silently pair with an older sidecar whose Windows frame
+// metadata used display DPI for that conversion.
+pub const CAPABILITY_CONTRACT_VERSION: u32 = 2;
+#[cfg(target_os = "windows")]
 pub const BACKEND_NAME: &str = "win_native";
+#[cfg(target_os = "macos")]
+pub const BACKEND_NAME: &str = "mac_native";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub const BACKEND_NAME: &str = "unsupported";
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

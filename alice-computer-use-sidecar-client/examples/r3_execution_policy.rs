@@ -547,6 +547,7 @@ mod windows_runner {
             intent: ComputerExecutionIntent::Semantic(action),
             strategy,
             fallback_policy,
+            execution_mode: Default::default(),
         }
     }
 
