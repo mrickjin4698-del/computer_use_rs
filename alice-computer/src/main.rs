@@ -66,7 +66,26 @@ impl RequestReplayWindow {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
+fn main() {
+    if let Err(error) = WinNativeBackend::attach_to_input_desktop() {
+        // Keep secure desktops fail-closed. When launched by Codex, this
+        // moves the process from its per-task sandbox desktop to Default
+        // before Tokio creates worker threads and the sidecar starts serving.
+        eprintln!("alice-computer: interactive desktop attach skipped: {error}");
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build Tokio runtime");
+    let result = runtime.block_on(run());
+    if let Err(error) = result {
+        eprintln!("alice-computer: {error}");
+        process::exit(1);
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(error) = run().await {

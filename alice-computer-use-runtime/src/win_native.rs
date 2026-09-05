@@ -50,8 +50,8 @@ use windows::Win32::{
     },
     System::{
         StationsAndDesktops::{
-            GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_ACCESS_FLAGS,
-            DESKTOP_CONTROL_FLAGS, UOI_NAME,
+            GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
+            DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
         },
         Threading::{
             AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
@@ -770,6 +770,49 @@ impl WinNativeBackend {
             frames: HashMap::new(),
             self_security: None,
             capability_cache: HashMap::new(),
+        }
+    }
+
+    /// Move a broker process launched from a Codex sandbox desktop onto the
+    /// logged-in user's interactive desktop before worker threads are created.
+    ///
+    /// Codex may start an MCP child on a per-task desktop (for example,
+    /// `CodexSandboxDesktop-*`) while the input desktop remains `Default`.
+    /// New threads inherit the desktop of their creator, so doing this before
+    /// the Tokio runtime starts lets the sidecar observe and control the same
+    /// desktop as Alice Electron. We only attach to the conventional `Default`
+    /// desktop; secure desktops such as Winlogon or ScreenSaver remain
+    /// protected and return `false`.
+    pub fn attach_to_input_desktop() -> Result<bool, ComputerError> {
+        unsafe {
+            let current = GetThreadDesktop(GetCurrentThreadId()).map_err(|error| {
+                ComputerError::SecurityContextUnavailable(format!(
+                    "GetThreadDesktop failed: {error}"
+                ))
+            })?;
+            let input = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(1))
+                .map_err(|error| {
+                    ComputerError::SecurityContextUnavailable(format!(
+                        "OpenInputDesktop failed: {error}"
+                    ))
+                })?;
+            let current_name = desktop_name(HANDLE(current.0))?;
+            let input_name = desktop_name(HANDLE(input.0))?;
+            let should_attach = !current_name.eq_ignore_ascii_case(&input_name)
+                && input_name.eq_ignore_ascii_case("Default");
+            if should_attach {
+                let result = SetThreadDesktop(input);
+                let _ = windows::Win32::System::StationsAndDesktops::CloseDesktop(input);
+                result.map_err(|error| {
+                    ComputerError::SecurityContextUnavailable(format!(
+                        "SetThreadDesktop(Default) failed: {error}"
+                    ))
+                })?;
+                Ok(true)
+            } else {
+                let _ = windows::Win32::System::StationsAndDesktops::CloseDesktop(input);
+                Ok(false)
+            }
         }
     }
 
@@ -4065,7 +4108,15 @@ fn millis_from_micros(value: u128) -> u128 {
 fn external_input_action_requires_fixture_evidence(action: &ComputerAction) -> bool {
     matches!(
         action,
-        ComputerAction::MouseDown { .. }
+        // Keyboard/text dispatch has no reliable, backend-independent state
+        // readback. Treat a successful SendInput transaction as performed and
+        // leave application-level verification to the caller. Without these
+        // variants a hotkey or text action was sent successfully but then
+        // downgraded to `verification_failed` because no UIA state changed.
+        ComputerAction::TypeText { .. }
+            | ComputerAction::KeyPress { .. }
+            | ComputerAction::Hotkey { .. }
+            | ComputerAction::MouseDown { .. }
             | ComputerAction::MouseUp { .. }
             | ComputerAction::MiddleClick { .. }
             | ComputerAction::TripleClick { .. }
@@ -4718,6 +4769,30 @@ mod frame_store_tests {
         };
         assert!(!pixel_foreground_admitted(false, &target, &key));
         assert!(pixel_foreground_admitted(true, &target, &key));
+    }
+
+    #[test]
+    fn keyboard_and_text_dispatch_use_external_fixture_verification() {
+        let target = Some(WindowId::new("target"));
+        assert!(external_input_action_requires_fixture_evidence(
+            &ComputerAction::TypeText {
+                text: "hello".into(),
+                target: target.clone(),
+                at: None,
+            }
+        ));
+        assert!(external_input_action_requires_fixture_evidence(
+            &ComputerAction::KeyPress {
+                key: "Enter".into(),
+                target: target.clone(),
+            }
+        ));
+        assert!(external_input_action_requires_fixture_evidence(
+            &ComputerAction::Hotkey {
+                keys: vec!["ctrl".into(), "l".into()],
+                target,
+            }
+        ));
     }
 
     #[test]

@@ -14,6 +14,8 @@ use alice_computer_use_core::{
     ComputerFallbackPolicy, ComputerPointerAction, Coordinate, CoordinateSpace, ElementId,
     FrameEncoding, MouseButton, Point, SemanticAction, SemanticObservationLimits, Size, WindowId,
 };
+#[cfg(windows)]
+use alice_computer_use_runtime::WinNativeBackend;
 use alice_computer_use_sidecar_client::{
     ComputerHostService, ComputerHostServiceConfig, ComputerHostServiceState,
 };
@@ -1379,10 +1381,15 @@ fn parse_computer_use_action(
                     "keypress.keys must contain at least one key",
                 ));
             }
-            Ok(ComputerUseStep::Actions(vec![ComputerAction::Hotkey {
-                keys,
-                target,
-            }]))
+            let action = if keys.len() == 1 {
+                ComputerAction::KeyPress {
+                    key: keys.into_iter().next().expect("one key was checked"),
+                    target,
+                }
+            } else {
+                ComputerAction::Hotkey { keys, target }
+            };
+            Ok(ComputerUseStep::Actions(vec![action]))
         }
         "click" => {
             let coordinate = screenshot_coordinate(object, frame)?;
@@ -2229,6 +2236,14 @@ fn run() -> AdapterResult<()> {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if let Err(error) = WinNativeBackend::attach_to_input_desktop() {
+        // Keep secure desktops fail-closed. A Codex sandbox desktop can be
+        // attached to the user's Default desktop before the sidecar is
+        // spawned; if Windows denies that transition, health remains
+        // protected and the broker refuses side effects.
+        eprintln!("{SERVER_NAME}: interactive desktop attach skipped: {error}");
+    }
     if let Err(error) = run() {
         eprintln!("{SERVER_NAME}: {error}");
         process::exit(1);
@@ -2428,6 +2443,33 @@ mod tests {
         ));
         assert_eq!(normalize_key_name("CTRL"), "ctrl");
         assert_eq!(normalize_key_name("ARROWRIGHT"), "right");
+    }
+
+    #[test]
+    fn computer_use_keypress_distinguishes_single_keys_from_hotkeys() {
+        let single = parse_computer_use_action(
+            &json!({ "type": "keypress", "keys": ["enter"] }),
+            None,
+            None,
+        )
+        .expect("single key parses");
+        assert!(matches!(
+            single,
+            ComputerUseStep::Actions(actions)
+                if matches!(actions.as_slice(), [ComputerAction::KeyPress { key, target: None }] if key == "enter")
+        ));
+
+        let hotkey = parse_computer_use_action(
+            &json!({ "type": "keypress", "keys": ["ctrl", "l"] }),
+            None,
+            None,
+        )
+        .expect("hotkey parses");
+        assert!(matches!(
+            hotkey,
+            ComputerUseStep::Actions(actions)
+                if matches!(actions.as_slice(), [ComputerAction::Hotkey { keys, target: None }] if keys == &["ctrl", "l"])
+        ));
     }
 
     #[test]

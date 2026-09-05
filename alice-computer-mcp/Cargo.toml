@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 alice-computer-use-core = { path = "../alice-computer-use-core" }
 alice-computer-use-broker = { path = "../alice-computer-use-broker" }
+alice-computer-use-runtime = { path = "../alice-computer-use-runtime" }
 alice-computer-use-sidecar-client = { path = "../alice-computer-use-sidecar-client" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
